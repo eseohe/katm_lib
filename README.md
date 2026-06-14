@@ -20,6 +20,12 @@ pip install -e .
 
 ---
 
+## Getting Started
+
+For a complete step-by-step guide covering data preparation, all parameters, keyphrase extractors, evaluation, and standalone components, see **[USAGE_GUIDE.md](USAGE_GUIDE.md)**.
+
+---
+
 ## Quick Start
 
 Fit KATM on the 20 Newsgroups dataset and print the discovered topics:
@@ -34,7 +40,7 @@ dataset = fetch_20newsgroups(subset="all", categories=categories, remove=("heade
 docs = dataset.data
 
 # Fit KATM with the default keyphrase extractor (KeyBERT + sentence-transformers)
-model = KATM(n_topics=5, keyphrase_algo="keybert")
+model = KATM(n_topics=5, kp_algorithm="keybert")
 model.fit(docs)
 
 # Print discovered topics
