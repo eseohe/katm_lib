@@ -43,6 +43,9 @@ docs = dataset.data
 model = KATM(n_topics=5, kp_algorithm="keybert")
 model.fit(docs)
 
+# Or use the fast variant (KATMFast) via a single parameter:
+# model = KATM(n_topics=5, kp_algorithm="keybert", fast=True)
+
 # Print discovered topics
 for topic_id, keywords in enumerate(model.topics_):
     print(f"Topic {topic_id}: {keywords}")
@@ -56,8 +59,8 @@ for topic_id, keywords in enumerate(model.topics_):
 
 | Class | Description |
 |---|---|
-| `KATM` | Full KATM topic model. Fits keyphrase-anchored topics on a corpus. |
-| `KATMFast` | Accelerated KATM variant using vectorized word-topic projection. |
+| `KATM` | Full KATM topic model. Pass `fast=True` to get KATMFast without changing imports. |
+| `KATMFast` | Accelerated KATM variant using vectorized word-topic projection (S3+S4). |
 | `DocumentBuilder` | Preprocesses raw documents into tokenized, cleaned text suitable for topic modeling. |
 | `KeyphraseExtractor` | Extracts keyphrases from documents using a configurable algorithm (KeyBERT, RAKE, YAKE, TF-IDF, GSC). |
 | `SentenceEmbedder` | Computes sentence-level embeddings using `sentence-transformers` for keyphrase scoring. |

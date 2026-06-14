@@ -196,6 +196,7 @@ doc_topic_matrix = model.fit_transform(documents)
 
 ```python
 model = KATM(
+    fast=False,                      # True = use KATMFast; False = standard KATM
     kp_algorithm="keybert",          # "keybert" | "rake" | "yake" | "tfidf" | "gsc"
     n_keyphrases=10,                 # Number of keyphrases extracted per document
     embedding_model="all-MiniLM-L6-v2",  # Sentence-transformer model name
@@ -265,6 +266,18 @@ for algo in algorithms:
 `KATMFast` is a drop-in replacement for `KATM` with two speedups:
 - **S3** — Vectorized anchor deduplication (replaces O(n²) sklearn calls with a single BLAS matrix operation)
 - **S4** — Incremental MMR (replaces O(N·K²) loop with O(N·K) updates)
+
+You can switch to the fast variant with a single parameter — no import changes needed:
+
+```python
+from katm import KATM
+
+model = KATM(n_topics=10, kp_algorithm="keybert", fast=True)
+model.fit(documents)
+model.print_topics(n_words=10)
+```
+
+Or import `KATMFast` directly:
 
 ```python
 from katm import KATMFast
@@ -500,6 +513,7 @@ model = KATM(
     n_keyphrases=10,
     top_n_words=15,
     min_df=2,
+    # fast=True,  # Uncomment to use KATMFast instead
 )
 model.fit(docs)
 

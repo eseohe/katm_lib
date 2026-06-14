@@ -22,3 +22,14 @@ def test_all_public_symbols():
     assert hasattr(katm, "clean_text")
     assert hasattr(katm, "build_vocabulary")
     assert hasattr(katm, "extract_content_words")
+
+
+def test_katm_fast_parameter():
+    """fast=False returns standard KATM; fast=True returns KATMFast."""
+    from katm.topic_model import KATM as _KATMBase
+
+    m1 = katm.KATM(fast=False)
+    assert type(m1) is _KATMBase
+
+    m2 = katm.KATM(fast=True)
+    assert type(m2) is katm.KATMFast
