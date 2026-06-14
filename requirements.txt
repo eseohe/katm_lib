@@ -1,0 +1,15 @@
+numpy
+scikit-learn
+sentence-transformers
+torch
+nltk
+keybert
+yake
+rake-nltk
+spacy
+gensim
+pandas
+matplotlib
+jupyter
+notebook
+octis
