@@ -47,7 +47,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/katm"
+Homepage = "https://github.com/eseohe/katm_lib"
 
 [tool.setuptools.packages.find]
 where = ["src"]
