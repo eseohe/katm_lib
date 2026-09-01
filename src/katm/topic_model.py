@@ -34,6 +34,17 @@ class KATM:
         max_anchor_df_ratio: float = 0.4,
         mmr_diversity: float = 0.2,
         mmr_max_sim: float = 0.85,
+        exclusive_assignment: bool = False,
+        keybert_use_mmr: bool = False,
+        keybert_diversity: float = 0.5,
+        language: str = "english",
+        gmm_covariance_type: str = "full",
+        keyphrase_scope: str = "per_document",
+        n_keyphrases_total: int = 500,
+        global_top_k_docs: "int | None" = None,
+        global_ranking_mode: str = "top_k_average",
+        global_membership_n_per_doc: int = 10,
+        long_document_strategy: str = "truncate",
     ):
         """Initialize KATM model.
 
@@ -64,6 +75,72 @@ class KATM:
                 word is excluded before scoring. Prevents near-morphological
                 duplicates (e.g. anxious/anxiousness, sim=0.93) regardless of
                 lambda. Default 0.85.
+            exclusive_assignment: If True, a word can only be listed in the
+                one topic it is most similar to (argmax across all topics'
+                centroids), instead of every topic independently filling its
+                own list from any word above soft_threshold — on some
+                corpora this stops adjacent topics from sharing a large
+                fraction of their displayed words. Default False, fully
+                backward-compatible. See WordTopicProjector.project_vocabulary.
+            keybert_use_mmr: If True and kp_algorithm="keybert", diversifies
+                KeyBERT's own top-n_keyphrases candidates per document with MMR
+                instead of plain top-n-by-relevance. Distinct from mmr_diversity/
+                mmr_max_sim above, which operate on the final per-topic word list
+                built later from the anchor pool — this instead fixes candidate
+                diversity at the very first extraction step, before anchors are
+                even built. Default False to preserve backward compatibility.
+            keybert_diversity: MMR lambda passed to KeyBERT when
+                keybert_use_mmr=True. Default 0.5 (KeyBERT's own default).
+            language: "english" (default) or any other NLTK-supported language
+                code (e.g. "german"). Selects the stopword list used by
+                keyphrase extraction (both kp_algorithm="keybert" and
+                keyphrase_scope="global") via utils._stopwords_for.
+                content_words_method extraction is English-only regardless —
+                this does not affect the topic word-list vocabulary, only
+                which phrases become GMM anchors. embedding_model is
+                independent of this — pick a model that actually supports the
+                language separately.
+            gmm_covariance_type: Covariance type for the GMM that clusters
+                anchor embeddings into topics — see GMMTopicClusterer's own
+                docstring for the full rationale. Default "full" (unchanged
+                behavior); consider "diag" whenever the anchor pool is large
+                relative to embedding dimensionality, which is typical of
+                keyphrase_scope="global" (anchor pool = n_keyphrases_total,
+                default 500, vs the smaller per-document-dedup pool "full"
+                was validated against).
+            keyphrase_scope: "per_document" (default, unchanged behavior —
+                KeyBERT runs once per document, candidates pooled and doc-
+                frequency-filtered) or "global" (one pass over the whole
+                corpus instead of one extraction call per document — see
+                katm.global_keyphrases for the mechanism). Only used when
+                kp_algorithm="keybert" — other algorithms ignore it and
+                always run per-document. Typically 2.5-3.5x faster than
+                per_document mode; there is no universally-better setting, so
+                compare both on your own corpus before switching.
+            n_keyphrases_total: Total keyphrase budget extracted once from
+                the whole corpus — only used when keyphrase_scope="global".
+                Default 500.
+            global_top_k_docs: Only used when keyphrase_scope="global". Size
+                of the per-candidate averaging window in the local-relevance
+                ranking — see global_keyphrases.extract_global_keyphrases's
+                docstring for the full mechanism. None (default) keeps the
+                original auto formula, max(5, min(50, n_docs // 20)).
+            global_ranking_mode: Only used when keyphrase_scope="global".
+                "top_k_average" (default, unchanged behavior) or
+                "membership" — see global_keyphrases.py's module docstring
+                for the mechanism and trade-off of each.
+            global_membership_n_per_doc: Only used when
+                global_ranking_mode="membership". Per-document top-N window
+                size for the membership vote, mirroring per-document mode's
+                own n_keyphrases. Default 10.
+            long_document_strategy: "truncate" (default, unchanged behavior)
+                or "chunk" — only affects kp_algorithm="keybert",
+                keyphrase_scope="per_document". See
+                KeyphraseExtractor's docstring for the full mechanism: fixes
+                KeyBERT ranking candidates only against a whole-document
+                embedding that SentenceTransformer.encode() silently
+                truncates at the model's max_seq_length. A no-op for any
+                document that already fits within max_seq_length.
             tfidf_ngram_range: n-gram range for TF-IDF keyphrase mode.
                 Default (1, 2) extracts unigrams and bigrams.
             keybert_ngram_range: n-gram range for KeyBERT candidate generation.
@@ -98,6 +175,17 @@ class KATM:
         self.max_anchor_df_ratio = max_anchor_df_ratio
         self.mmr_diversity = mmr_diversity
         self.mmr_max_sim = mmr_max_sim
+        self.exclusive_assignment = exclusive_assignment
+        self.keybert_use_mmr = keybert_use_mmr
+        self.keybert_diversity = keybert_diversity
+        self.language = language
+        self.gmm_covariance_type = gmm_covariance_type
+        self.keyphrase_scope = keyphrase_scope
+        self.n_keyphrases_total = n_keyphrases_total
+        self.global_top_k_docs = global_top_k_docs
+        self.global_ranking_mode = global_ranking_mode
+        self.global_membership_n_per_doc = global_membership_n_per_doc
+        self.long_document_strategy = long_document_strategy
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -124,39 +212,58 @@ class KATM:
         # Step 1: Load the shared embedder first so KeyBERT can reuse it
         embedder = SentenceEmbedder(model_name=self.embedding_model)
 
-        # Step 2: Extract keyphrases (pass embedder._model to avoid a second load)
-        kp_extractor = KeyphraseExtractor(
-            algorithm=self.kp_algorithm,
-            n_keyphrases=self.n_keyphrases,
-            pretrained_model=embedder._model,
-            yake_use_position=self.yake_use_position,
-            tfidf_ngram_range=self.tfidf_ngram_range,
-            keybert_ngram_range=self.keybert_ngram_range,
-        )
-        doc_keyphrases = kp_extractor.extract(documents)
-
-        # Step 3: Flatten keyphrases, track doc-frequency per phrase.
-        # Sorting by doc-frequency before semantic dedup ensures the most
-        # representative (common) phrases survive as GMM anchors — rare
-        # one-off phrases are removed as near-duplicates of common ones.
-        from collections import Counter as _Counter
-        doc_freq: _Counter = _Counter()
-        for kps in doc_keyphrases:
-            for kp in set(kps):   # count each phrase once per document
-                doc_freq[kp] += 1
-
-        # Apply document-frequency filter before sorting.
-        # min_anchor_df removes hapax phrases (too specific to one doc).
-        # max_anchor_df_ratio removes ubiquitous phrases that appear in so many
-        # docs they carry no class signal (e.g. "feel like" in 73 % of MH posts).
-        n_docs = len(documents)
-        max_df = int(self.max_anchor_df_ratio * n_docs) if self.max_anchor_df_ratio else n_docs
-        all_keyphrases = [
-            kp for kp, freq in sorted(
-                doc_freq.items(), key=lambda x: (-x[1], x[0])
+        # Step 2/3: Extract keyphrases and build the doc-frequency-filtered
+        # anchor pool. "global" only applies to kp_algorithm="keybert" (see
+        # __init__ docstring) - other algorithms always run per-document.
+        if self.keyphrase_scope == "global" and self.kp_algorithm == "keybert":
+            from .global_keyphrases import extract_global_keyphrases
+            all_keyphrases = extract_global_keyphrases(
+                documents, embedder, self.keybert_ngram_range, self.language,
+                self.min_anchor_df, self.max_anchor_df_ratio, self.n_keyphrases_total,
+                top_k_docs=self.global_top_k_docs,
+                ranking_mode=self.global_ranking_mode,
+                membership_n_per_doc=self.global_membership_n_per_doc,
             )
-            if self.min_anchor_df <= freq <= max_df
-        ]
+        else:
+            # Extract keyphrases (pass embedder._model to avoid a second load)
+            from .utils import _stopwords_for as _kp_stopwords_for
+            kp_stop_words = "english" if self.language == "english" else list(_kp_stopwords_for(self.language))
+            kp_extractor = KeyphraseExtractor(
+                algorithm=self.kp_algorithm,
+                n_keyphrases=self.n_keyphrases,
+                pretrained_model=embedder._model,
+                yake_use_position=self.yake_use_position,
+                tfidf_ngram_range=self.tfidf_ngram_range,
+                keybert_ngram_range=self.keybert_ngram_range,
+                keybert_use_mmr=self.keybert_use_mmr,
+                keybert_diversity=self.keybert_diversity,
+                keybert_stop_words=kp_stop_words,
+                long_document_strategy=self.long_document_strategy,
+            )
+            doc_keyphrases = kp_extractor.extract(documents)
+
+            # Flatten keyphrases, track doc-frequency per phrase.
+            # Sorting by doc-frequency before semantic dedup ensures the most
+            # representative (common) phrases survive as GMM anchors — rare
+            # one-off phrases are removed as near-duplicates of common ones.
+            from collections import Counter as _Counter
+            doc_freq: _Counter = _Counter()
+            for kps in doc_keyphrases:
+                for kp in set(kps):   # count each phrase once per document
+                    doc_freq[kp] += 1
+
+            # Apply document-frequency filter before sorting.
+            # min_anchor_df removes hapax phrases (too specific to one doc).
+            # max_anchor_df_ratio removes ubiquitous phrases that appear in so many
+            # docs they carry no class signal (e.g. "feel like" in 73 % of MH posts).
+            n_docs = len(documents)
+            max_df = int(self.max_anchor_df_ratio * n_docs) if self.max_anchor_df_ratio else n_docs
+            all_keyphrases = [
+                kp for kp, freq in sorted(
+                    doc_freq.items(), key=lambda x: (-x[1], x[0])
+                )
+                if self.min_anchor_df <= freq <= max_df
+            ]
 
         if not all_keyphrases:
             self.topics_ = {}
@@ -186,6 +293,7 @@ class KATM:
         clusterer = GMMTopicClusterer(
             n_topics=self.n_topics,
             soft_threshold=self.soft_threshold,
+            covariance_type=self.gmm_covariance_type,
         )
         clusterer.fit(keyphrase_embeddings)
         self._embedder  = embedder
@@ -204,6 +312,7 @@ class KATM:
                 mmr_diversity=self.mmr_diversity,
                 mmr_max_sim=self.mmr_max_sim,
                 normalize_embeddings=self.normalize_embeddings,
+                exclusive_assignment=self.exclusive_assignment,
             )
             # Limit to top_n_words per topic
             for tid in self.topics_:

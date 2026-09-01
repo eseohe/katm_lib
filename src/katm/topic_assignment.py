@@ -29,6 +29,7 @@ class WordTopicProjector:
         mmr_diversity: float = 0.2,
         mmr_max_sim: float = 0.85,
         normalize_embeddings: bool = False,
+        exclusive_assignment: bool = False,
     ) -> Dict[int, List[Tuple[str, float]]]:
         """Project vocabulary words onto topics via cosine similarity + MMR.
 
@@ -50,6 +51,17 @@ class WordTopicProjector:
             mmr_max_sim: Hard dedup cap. Any candidate with cosine similarity
                 above this threshold to any already-selected word is excluded
                 entirely, regardless of its MMR score. Default 0.85.
+            exclusive_assignment: If True, a word only competes for a topic
+                if that topic is its single best (argmax) match across all
+                n_topics centroid similarities. Default False (original
+                behavior): each topic is filled independently, so a word
+                above min_prob for several centroids at once can be listed
+                in all of their word lists — on some corpora adjacent topics
+                can then share a large fraction of their displayed words,
+                wasting slots a more distinctive word could have filled.
+                This is a different mechanism from mmr_max_sim/mmr_diversity
+                (which only dedup *within* one topic's own list) — this is
+                what makes topics compete with each other for the same word.
 
         Returns:
             Dictionary mapping topic_id to list of (word, similarity) tuples,
@@ -76,11 +88,20 @@ class WordTopicProjector:
             tid: [] for tid in range(n_topics)
         }
 
+        # Cross-topic exclusivity gate (see exclusive_assignment's docstring
+        # above) — computed once, against the same sim_matrix every topic
+        # already uses, so every topic judges "who owns this word" the same way.
+        best_topic_per_word = np.argmax(sim_matrix, axis=1) if exclusive_assignment else None
+
         for topic_id in range(n_topics):
             sim_to_centroid = sim_matrix[:, topic_id]
 
             # Filter candidates above threshold and rank by similarity
             candidate_indices = np.where(sim_to_centroid >= min_prob)[0]
+            if exclusive_assignment:
+                candidate_indices = candidate_indices[
+                    best_topic_per_word[candidate_indices] == topic_id
+                ]
             if len(candidate_indices) == 0:
                 continue
 
@@ -97,10 +118,17 @@ class WordTopicProjector:
             unselected = top_indices[1:]
 
             # Seed: sims of all unselected candidates to the first selected word.
-            max_sim_to_selected = cosine_similarity(
-                word_embeddings[unselected],
-                word_embeddings[[selected[0]]],
-            )[:, 0].copy()
+            # Guard the degenerate case of exactly one candidate above min_prob
+            # (unselected == []) — cosine_similarity rejects a 0-sample array,
+            # and the while loop below already no-ops on an empty `unselected`,
+            # so an empty float array here is the correct thing to reach it with.
+            if unselected:
+                max_sim_to_selected = cosine_similarity(
+                    word_embeddings[unselected],
+                    word_embeddings[[selected[0]]],
+                )[:, 0].copy()
+            else:
+                max_sim_to_selected = np.array([], dtype=float)
 
             while len(selected) < 50 and unselected:
                 # Hard dedup: drop near-duplicates of already-selected words

@@ -100,30 +100,153 @@ def _all_stop(phrase: str) -> bool:
     return all(w in _EXTENDED_STOP or w.isdigit() for w in words)
 
 
+def _chunk_text_for_embedding(text: str, tokenizer, max_tokens: int) -> List[str]:
+    """Splits text into sentence-packed chunks that each fit within
+    max_tokens, measured with the embedding model's own tokenizer (not a
+    word-count approximation). Greedily fills each chunk with whole
+    sentences until the next sentence would exceed the budget, then starts
+    a new chunk — so sentence boundaries are never broken except in the
+    rare case of a single sentence alone exceeding max_tokens, which is
+    hard-split by raw token windows as a fallback.
+
+    A document that already fits within max_tokens returns a single chunk
+    (the whole text unchanged) — this is what makes
+    long_document_strategy="chunk" a strict fix rather than a behavior
+    change for documents already under the limit. Also used by
+    global_keyphrases.extract_global_keyphrases (keyphrase_scope="global")
+    for the same reason.
+    """
+    n_tokens = len(tokenizer.encode(text, add_special_tokens=True, truncation=False))
+    if n_tokens <= max_tokens:
+        return [text]
+
+    sentences = nltk.sent_tokenize(text)
+    if not sentences:
+        return [text]
+
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for sent in sentences:
+        sent_len = len(tokenizer.encode(sent, add_special_tokens=False, truncation=False))
+        if sent_len > max_tokens:
+            # A single sentence alone exceeds the budget - flush whatever's
+            # pending, then hard-split this one sentence by raw token count.
+            if current:
+                chunks.append(" ".join(current))
+                current, current_len = [], 0
+            ids = tokenizer.encode(sent, add_special_tokens=False, truncation=False)
+            for i in range(0, len(ids), max_tokens):
+                chunks.append(tokenizer.decode(ids[i:i + max_tokens]))
+            continue
+        # +2 for the [CLS]/[SEP] special tokens the real embedding call adds
+        if current and current_len + sent_len + 2 > max_tokens:
+            chunks.append(" ".join(current))
+            current, current_len = [], 0
+        current.append(sent)
+        current_len += sent_len
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks if chunks else [text]
+
+
+def _max_relevance_mmr(
+    relevance,
+    word_embeddings,
+    words: List[str],
+    top_n: int,
+    diversity: float,
+):
+    """Same greedy algorithm as keybert's own MMR, adapted to take a
+    precomputed per-candidate relevance score (here: max cosine similarity
+    across a document's own chunks) instead of similarity to a single
+    doc_embedding — KeyBERT's own use_mmr path only supports the latter, so
+    this is a light adaptation for long_document_strategy="chunk"."""
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    word_similarity = cosine_similarity(word_embeddings)
+
+    keywords_idx = [int(np.argmax(relevance))]
+    candidates_idx = [i for i in range(len(words)) if i != keywords_idx[0]]
+
+    for _ in range(min(top_n - 1, len(words) - 1)):
+        candidate_relevance = relevance[candidates_idx]
+        target_similarities = np.max(word_similarity[candidates_idx][:, keywords_idx], axis=1)
+        mmr_scores = (1 - diversity) * candidate_relevance - diversity * target_similarities
+        best_local = int(np.argmax(mmr_scores))
+        best_idx = candidates_idx[best_local]
+        keywords_idx.append(best_idx)
+        candidates_idx.remove(best_idx)
+
+    keywords_idx.sort(key=lambda i: -relevance[i])
+    return [words[i] for i in keywords_idx]
+
+
 class KeyphraseExtractor:
-    """Extracts keyphrases from documents using KeyBERT, RAKE, YAKE, GSC, or TF-IDF."""
+    """Extracts keyphrases from documents using KeyBERT, RAKE, YAKE, or TF-IDF."""
 
     def __init__(self, algorithm: str = "keybert", n_keyphrases: int = 10, pretrained_model=None,
                  yake_use_position: bool = False, tfidf_ngram_range: tuple = (1, 2),
-                 keybert_ngram_range: tuple = (1, 2)):
+                 keybert_ngram_range: tuple = (1, 2), keybert_use_mmr: bool = False,
+                 keybert_diversity: float = 0.5, keybert_stop_words="english",
+                 long_document_strategy: str = "truncate"):
         """Initialize KeyphraseExtractor.
 
         Args:
-            algorithm: "keybert", "rake", "yake", "gsc", or "tfidf".
+            algorithm: "keybert", "rake", "yake", or "tfidf".
             n_keyphrases: Number of top keyphrases to extract per document.
-            pretrained_model: Optional pre-loaded SentenceTransformer to pass to KeyBERT
-                and GSC, avoiding a second model load when the caller already has one.
+            pretrained_model: Optional pre-loaded SentenceTransformer to pass to KeyBERT,
+                avoiding a second model load when the caller already has one.
             tfidf_ngram_range: n-gram range for TF-IDF mode (default (1, 2)).
             keybert_ngram_range: n-gram range for KeyBERT candidate generation (default
                 (1, 2)). (1, 3) captures longer phrases but encodes ~2× more candidates
                 and roughly doubles extraction time with minimal anchor quality gain.
+            keybert_use_mmr: If True and algorithm="keybert", diversifies KeyBERT's
+                top-n_keyphrases candidates per document with Maximal Marginal
+                Relevance instead of plain top-N-by-relevance. Default False
+                (KeyBERT's own default) — without it, a document's top-N tends to
+                be dominated by redundant n-gram variants of whichever word is
+                most central to it (e.g. "wickham", "mr wickham", "wickham
+                cluster" all in one document's top 10), which is a candidate-
+                diversity problem, not a keyphrase-count problem.
+            keybert_diversity: MMR lambda passed to KeyBERT when
+                keybert_use_mmr=True (0 = pure relevance, 1 = pure diversity).
+                Default 0.5, KeyBERT's own default.
+            keybert_stop_words: Stop-word list passed to KeyBERT's own
+                extract_keywords call. Either the string "english" (KeyBERT's
+                built-in list, default) or an explicit list of stopwords for
+                another language — KeyBERT/sklearn's CountVectorizer accepts
+                either. KATM passes its own utils._stopwords_for(language)
+                result here when language != "english".
+            long_document_strategy: "truncate" (default, unchanged behavior)
+                or "chunk". Only affects algorithm="keybert". KeyBERT ranks
+                candidate phrases by cosine similarity to a single embedding
+                of the whole document, but SentenceTransformer.encode()
+                silently truncates that embedding at the model's
+                max_seq_length (256 tokens for the common all-MiniLM-L6-v2
+                default) — so on a document longer than that, everything past
+                the limit is invisible to the ranking step. "chunk" fixes this
+                by splitting any document exceeding max_seq_length into
+                sentence-packed chunks that each fit within it, embedding
+                every chunk, and scoring each candidate phrase by its MAXIMUM
+                cosine similarity across the document's own chunks instead of
+                one (possibly truncated) whole-document embedding. A no-op
+                (identical output to "truncate") for any document that
+                already fits within max_seq_length, so switching this on is a
+                strict fix, never a regression, for short documents.
 
         Raises:
             ValueError: If algorithm is not recognized.
         """
-        valid_algorithms = {"keybert", "rake", "yake", "gsc", "tfidf"}
+        valid_algorithms = {"keybert", "rake", "yake", "tfidf"}
         if algorithm not in valid_algorithms:
             raise ValueError(f"Unknown algorithm '{algorithm}'. Must be one of {valid_algorithms}")
+        if long_document_strategy not in {"truncate", "chunk"}:
+            raise ValueError(
+                f"long_document_strategy must be 'truncate' or 'chunk' - got {long_document_strategy!r}"
+            )
 
         self.algorithm = algorithm
         self.n_keyphrases = n_keyphrases
@@ -131,6 +254,10 @@ class KeyphraseExtractor:
         self._yake_use_position = yake_use_position
         self._tfidf_ngram_range = tfidf_ngram_range
         self._keybert_ngram_range = keybert_ngram_range
+        self._keybert_use_mmr = keybert_use_mmr
+        self._keybert_diversity = keybert_diversity
+        self._keybert_stop_words = keybert_stop_words
+        self._long_document_strategy = long_document_strategy
         self._keybert_model = None
         self._yake_extractor = None
 
@@ -152,8 +279,6 @@ class KeyphraseExtractor:
             return self._extract_rake(documents)
         elif self.algorithm == "yake":
             return self._extract_yake(documents)
-        elif self.algorithm == "gsc":
-            return self._extract_gsc(documents)
         elif self.algorithm == "tfidf":
             return self._extract_tfidf(documents)
 
@@ -169,17 +294,89 @@ class KeyphraseExtractor:
         if self._keybert_model is None:
             self._keybert_model = KeyBERT(model=self._pretrained_model)
 
+        if self._long_document_strategy == "chunk":
+            return self._extract_keybert_chunked(documents)
+
         # Pass the full corpus in one call so KeyBERT encodes all candidates
         # in a single batched model.encode() rather than one call per document.
-        # stop_words='english' reduces the candidate set before encoding.
-        all_keywords = self._keybert_model.extract_keywords(
-            documents,
+        extract_kwargs = dict(
             keyphrase_ngram_range=self._keybert_ngram_range,
             top_n=self.n_keyphrases,
-            stop_words="english",
+            stop_words=self._keybert_stop_words,
         )
+        if self._keybert_use_mmr:
+            extract_kwargs["use_mmr"] = True
+            extract_kwargs["diversity"] = self._keybert_diversity
+        all_keywords = self._keybert_model.extract_keywords(documents, **extract_kwargs)
+        # KeyBERT silently unwraps its own return value for a batch of exactly
+        # one document ([[(kw, score), ...]] -> [(kw, score), ...]) - re-wrap
+        # so downstream code can always assume one list per document
+        # regardless of how many documents were passed in. Not a behavior
+        # change for KATM's normal usage (always called with the full
+        # document batch), but a real bug for a single-document call.
+        if len(documents) == 1 and all_keywords and isinstance(all_keywords[0], tuple):
+            all_keywords = [all_keywords]
 
         return [[kp for kp, _ in doc_kws] for doc_kws in all_keywords]
+
+    def _extract_keybert_chunked(self, documents: List[str]) -> List[List[str]]:
+        """long_document_strategy="chunk" — see __init__'s docstring for the
+        full motivation. For each document: split into token-budget-limited,
+        sentence-packed chunks (a no-op single chunk when the document already
+        fits), embed every chunk, and score each candidate phrase by its
+        MAXIMUM cosine similarity across the document's own chunks rather than
+        similarity to one (possibly truncated) whole-document embedding."""
+        import numpy as np
+        from sklearn.feature_extraction.text import CountVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        # The actual SentenceTransformer backing this KeyBERT instance -
+        # retrieved from KeyBERT itself (not self._pretrained_model directly)
+        # so this also works when self._pretrained_model was None and
+        # KeyBERT lazily loaded its own default model.
+        st_model = self._keybert_model.model.embedding_model
+        max_tokens = getattr(st_model, "max_seq_length", 256) or 256
+
+        results: List[List[str]] = []
+        for doc in documents:
+            if not doc.strip():
+                results.append([])
+                continue
+
+            chunks = _chunk_text_for_embedding(doc, st_model.tokenizer, max_tokens)
+
+            try:
+                cv = CountVectorizer(
+                    ngram_range=self._keybert_ngram_range,
+                    stop_words=self._keybert_stop_words,
+                    min_df=1,
+                ).fit([doc])
+            except ValueError:
+                results.append([])  # no candidates survive (e.g. all-stopword document)
+                continue
+            candidates = list(cv.get_feature_names_out())
+            if not candidates:
+                results.append([])
+                continue
+
+            chunk_embeddings = st_model.encode(chunks, batch_size=32, show_progress_bar=False)
+            candidate_embeddings = st_model.encode(candidates, batch_size=64, show_progress_bar=False)
+
+            sim_to_chunks = cosine_similarity(candidate_embeddings, chunk_embeddings)  # (n_candidates, n_chunks)
+            relevance = sim_to_chunks.max(axis=1)
+
+            if self._keybert_use_mmr:
+                keywords = _max_relevance_mmr(
+                    relevance, candidate_embeddings, candidates,
+                    self.n_keyphrases, self._keybert_diversity,
+                )
+            else:
+                top_idx = np.argsort(relevance)[::-1][: self.n_keyphrases]
+                keywords = [candidates[i] for i in top_idx]
+
+            results.append(keywords)
+
+        return results
 
     def _extract_rake(self, documents: List[str]) -> List[List[str]]:
         """Extract keyphrases using RAKE.
@@ -314,111 +511,3 @@ class KeyphraseExtractor:
 
         return results
 
-    def _extract_gsc(self, documents: List[str]) -> List[List[str]]:
-        """Greedy Semantic Coverage (GSC) keyphrase extractor.
-
-        For each document:
-        1. Generate candidate n-gram phrases (1–3 words, content-word filtered).
-        2. Split the document into sentences.
-        3. Embed candidates and sentences with the shared sentence-transformer.
-        4. Greedy selection: at each step pick the phrase that maximally increases
-           total coverage, defined as the sum of per-sentence maximum cosine
-           similarities to any already-selected phrase.  This forces selected
-           phrases to cover different semantic regions of the document rather than
-           all converging on the same dominant topic.
-
-        Why this works better than RAKE/YAKE for semantically similar classes:
-        GSC uses embedding-based selection so it picks semantically discriminative
-        phrases (e.g. "manic episode", "suicidal ideation", "panic attack") rather
-        than statistically frequent ones.  Unlike KeyBERT which ranks by similarity
-        to the whole-document embedding, GSC distributes coverage across sentences,
-        capturing sub-topics that KeyBERT's single-vector target misses.
-        """
-        import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
-
-        if self._pretrained_model is None:
-            from sentence_transformers import SentenceTransformer
-            self._pretrained_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-        # ── sentence splitter ────────────────────────────────────────────────
-        _sent_end = re.compile(r'(?<=[.!?])\s+')
-
-        def _split_sentences(text: str) -> List[str]:
-            sents = [s.strip() for s in _sent_end.split(text) if len(s.strip()) > 15]
-            return sents if sents else [text]
-
-        # ── candidate generator ──────────────────────────────────────────────
-        _word_re   = re.compile(r"[a-z]{2,}")
-        _stop_re   = re.compile(
-            r"\b(?:" + "|".join(re.escape(w) for w in sorted(_EXTENDED_STOP, key=len, reverse=True)) + r")\b"
-        )
-
-        def _candidates(text: str) -> List[str]:
-            """n-grams (1–3 words) from content-word runs between stopwords."""
-            lowered = text.lower()
-            parts   = _stop_re.split(lowered)
-            cands: List[str] = []
-            seen: set = set()
-            for part in parts:
-                words = _word_re.findall(part)
-                for n in range(1, 4):
-                    for i in range(len(words) - n + 1):
-                        phrase = " ".join(words[i:i + n])
-                        if phrase not in seen and _is_clean_phrase(phrase):
-                            seen.add(phrase)
-                            cands.append(phrase)
-            return cands
-
-        # ── per-document GSC ─────────────────────────────────────────────────
-        results = []
-        for doc in documents:
-            if not doc.strip():
-                results.append([])
-                continue
-
-            cands = _candidates(doc)
-            if not cands:
-                results.append([])
-                continue
-
-            sents = _split_sentences(doc)
-
-            # Encode sentences + candidates in one call (no extra model loads)
-            all_texts  = sents + cands
-            all_embs   = self._pretrained_model.encode(
-                all_texts, batch_size=64, normalize_embeddings=True, show_progress_bar=False
-            )
-            sent_embs  = all_embs[:len(sents)]    # (n_sents, D)
-            cand_embs  = all_embs[len(sents):]    # (n_cands, D)
-
-            # sim_matrix[i, j] = cosine sim between candidate i and sentence j
-            sim_mat = _cos_sim(cand_embs, sent_embs)  # (n_cands, n_sents)
-
-            selected: List[int] = []
-            # covered[j] = max cosine sim of sentence j to any selected phrase
-            covered = np.zeros(len(sents))
-            remaining = list(range(len(cands)))
-
-            for _ in range(self.n_keyphrases):
-                if not remaining:
-                    break
-                best_idx, best_gain = -1, -1.0
-                rem_sims = sim_mat[remaining]          # (n_remaining, n_sents)
-                # Vectorised marginal gain for all remaining candidates at once
-                new_covered = np.maximum(covered, rem_sims)   # (n_remaining, n_sents)
-                gains = new_covered.sum(axis=1) - covered.sum()
-                best_local = int(np.argmax(gains))
-                best_gain  = float(gains[best_local])
-                best_idx   = remaining[best_local]
-
-                if best_gain <= 0:
-                    break
-
-                selected.append(best_idx)
-                covered = np.maximum(covered, sim_mat[best_idx])
-                remaining.pop(best_local)
-
-            results.append([cands[i] for i in selected])
-
-        return results

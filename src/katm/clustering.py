@@ -12,6 +12,7 @@ class GMMTopicClusterer:
         n_topics: int,
         soft_threshold: float = 0.15,
         random_state: int = 42,
+        covariance_type: str = "full",
     ):
         """Initialize GMMTopicClusterer.
 
@@ -19,10 +20,24 @@ class GMMTopicClusterer:
             n_topics: Number of GMM components (topics).
             soft_threshold: Not currently used, kept for API compatibility.
             random_state: Random seed for reproducibility.
+            covariance_type: sklearn GaussianMixture covariance type. Default
+                "full" (unchanged behavior). "full" gives each component
+                D(D+1)/2 free covariance parameters — with a typical
+                sentence-embedding dimensionality (D=384-1024) that can be
+                tens to hundreds of thousands of parameters per component,
+                wildly underdetermined against a modest anchor pool (a few
+                hundred to a couple thousand points after dedup). "diag" (D
+                parameters/component) is much better conditioned in that
+                regime and worth trying whenever the anchor pool is large
+                relative to embedding dimensionality — e.g.
+                KATM(keyphrase_scope="global"), whose anchor pool is the
+                n_keyphrases_total budget (default 500) rather than the
+                per-document-dedup pool "full" was validated against.
         """
         self.n_topics = n_topics
         self.soft_threshold = soft_threshold
         self.random_state = random_state
+        self.covariance_type = covariance_type
         self._gmm = None
         self._is_fitted = False
 
@@ -37,7 +52,7 @@ class GMMTopicClusterer:
         """
         self._gmm = GaussianMixture(
             n_components=self.n_topics,
-            covariance_type="full",
+            covariance_type=self.covariance_type,
             random_state=self.random_state,
             max_iter=200,
         )

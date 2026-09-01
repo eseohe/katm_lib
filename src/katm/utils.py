@@ -37,6 +37,25 @@ _EXTRA_STOP = {
 _ALL_STOP = _stopwords | _EXTRA_STOP
 
 
+def _stopwords_for(language: str) -> set:
+    """Stopword set for the given language, via NLTK's multilingual stopword
+    corpus. ``"english"`` (the default everywhere in KATM) returns the same
+    232-word list already loaded above. Any other NLTK-supported language
+    code (e.g. ``"german"``, ``"french"``) returns that language's plain
+    NLTK list — no extra augmentation beyond what NLTK ships, and falls back
+    to the English list if NLTK doesn't recognize the code. Used by
+    keyphrase extraction (per-document KeyBERT's stop_words and
+    keyphrase_scope="global"'s candidate-vocabulary filter); content-word
+    extraction (extract_content_words below) is English-only for now.
+    """
+    if language == "english":
+        return set(_stopwords)
+    try:
+        return set(nltk.corpus.stopwords.words(language))
+    except OSError:
+        return set(_stopwords)
+
+
 def clean_text(text: str) -> str:
     """Strip extra whitespace, normalize unicode, basic cleaning.
 

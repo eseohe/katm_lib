@@ -1,6 +1,6 @@
 # KATM — Keyphrase Anchored Topic Modeling
 
-KATM is a neural topic modeling library that anchors topic representations on document-level keyphrases. By leveraging keyphrase extraction algorithms (KeyBERT, RAKE, YAKE, TF-IDF, or GSC) to surface semantically meaningful multi-word phrases, KATM produces more coherent and interpretable topics than traditional bag-of-words approaches. KATM also ships a fast variant (`KATMFast`) that accelerates the word-topic projection step via vectorized deduplication.
+KATM is a neural topic modeling library that anchors topic representations on document-level keyphrases. By leveraging keyphrase extraction algorithms (KeyBERT, RAKE, YAKE, or TF-IDF) to surface semantically meaningful multi-word phrases, KATM produces more coherent and interpretable topics than traditional bag-of-words approaches. KATM also ships a fast variant (`KATMFast`) that accelerates the word-topic projection step via vectorized deduplication.
 
 ---
 
@@ -62,7 +62,7 @@ for topic_id, keywords in enumerate(model.topics_):
 | `KATM` | Full KATM topic model. Pass `fast=True` to get KATMFast without changing imports. |
 | `KATMFast` | Accelerated KATM variant using vectorized word-topic projection (S3+S4). |
 | `DocumentBuilder` | Preprocesses raw documents into tokenized, cleaned text suitable for topic modeling. |
-| `KeyphraseExtractor` | Extracts keyphrases from documents using a configurable algorithm (KeyBERT, RAKE, YAKE, TF-IDF, GSC). |
+| `KeyphraseExtractor` | Extracts keyphrases from documents using a configurable algorithm (KeyBERT, RAKE, YAKE, TF-IDF). |
 | `SentenceEmbedder` | Computes sentence-level embeddings using `sentence-transformers` for keyphrase scoring. |
 | `GMMTopicClusterer` | Clusters document/keyphrase embeddings into topic groups using Gaussian Mixture Models. |
 | `WordTopicProjector` | Projects vocabulary words into topic space via keyphrase-topic alignment. |
@@ -78,13 +78,32 @@ KATM supports multiple keyphrase extraction algorithms, configurable via the `ke
 - **RAKE** — Rapid Automatic Keyword Extraction using word co-occurrence and phrase boundary detection.
 - **YAKE** — Unsupervised keyword extraction based on statistical features (frequency, position, relatedness).
 - **TF-IDF** — Selects top-scoring n-grams by TF-IDF weight within each document.
-- **GSC** — Graph-based Salient Keyphrase extraction using TextRank-style graph scoring.
 
 Select the algorithm by passing `keyphrase_algo` to `KATM` or `KeyphraseExtractor`:
 ```python
 model = KATM(n_topics=5, keyphrase_algo="rake")   # RAKE-based topics
 model = KATM(n_topics=5, keyphrase_algo="yake")   # YAKE-based topics
 ```
+
+### Per-document vs. global keyphrase scope
+
+With `kp_algorithm="keybert"`, `keyphrase_scope` controls how candidate
+keyphrases are gathered:
+
+- `"per_document"` (default) — KeyBERT runs once per document; candidates
+  are pooled and filtered by document frequency.
+- `"global"` — one pass builds and ranks a single shared candidate
+  vocabulary for the whole corpus instead. Typically 2.5-3.5x faster on
+  medium/large corpora since each unique candidate is embedded once rather
+  than once per document it appears in.
+
+```python
+model = KATM(n_topics=5, kp_algorithm="keybert", keyphrase_scope="global",
+             n_keyphrases_total=500)
+```
+
+There's no universally-better setting — compare both on your own corpus.
+See `USAGE_GUIDE.md` §5.3 for the full parameter set.
 
 ---
 

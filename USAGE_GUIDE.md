@@ -197,7 +197,7 @@ doc_topic_matrix = model.fit_transform(documents)
 ```python
 model = KATM(
     fast=False,                      # True = use KATMFast; False = standard KATM
-    kp_algorithm="keybert",          # "keybert" | "rake" | "yake" | "tfidf" | "gsc"
+    kp_algorithm="keybert",          # "keybert" | "rake" | "yake" | "tfidf"
     n_keyphrases=10,                 # Number of keyphrases extracted per document
     embedding_model="all-MiniLM-L6-v2",  # Sentence-transformer model name
     n_topics=10,                     # Number of GMM clusters (topics)
@@ -214,6 +214,17 @@ model = KATM(
     max_anchor_df_ratio=0.4,         # Max fraction of docs a phrase may appear in
     mmr_diversity=0.2,               # MMR lambda: relevance/diversity trade-off
     mmr_max_sim=0.85,                # Hard dedup cap for word-list MMR
+    exclusive_assignment=False,      # Word can only be listed in its single best-matching topic
+    keybert_use_mmr=False,           # Diversify KeyBERT's own per-document candidates with MMR
+    keybert_diversity=0.5,           # MMR lambda for keybert_use_mmr
+    language="english",              # Stopword list for keyphrase extraction
+    gmm_covariance_type="full",      # GMM covariance type ("full" or "diag")
+    keyphrase_scope="per_document",  # "per_document" or "global"
+    n_keyphrases_total=500,          # Total anchor budget, keyphrase_scope="global" only
+    global_top_k_docs=None,          # Averaging window size, keyphrase_scope="global" only
+    global_ranking_mode="top_k_average",  # "top_k_average" or "membership"
+    global_membership_n_per_doc=10,  # Per-doc top-N window, global_ranking_mode="membership" only
+    long_document_strategy="truncate",  # "truncate" or "chunk"
 )
 ```
 
@@ -221,7 +232,7 @@ model = KATM(
 
 | Parameter | Change when... |
 |---|---|
-| `kp_algorithm` | KeyBERT is slow on large corpora → try `"rake"` or `"tfidf"` for speed. GSC gives best semantic coverage but is slowest. |
+| `kp_algorithm` | KeyBERT is slow on large corpora → try `"rake"` or `"tfidf"` for speed. |
 | `n_keyphrases` | Short documents → reduce to 3-5. Long documents → increase to 20-30. |
 | `embedding_model` | Need better quality → `"all-mpnet-base-v2"` (slower). Need speed → `"all-MiniLM-L6-v2"` (default). |
 | `n_topics` | More topics = finer granularity. Use domain knowledge or grid-search with coherence metrics. |
@@ -229,6 +240,51 @@ model = KATM(
 | `content_words_method` | Need speed → `"tfidf"` (default). Need linguistic precision → `"spacy"` (requires `en_core_web_sm`). |
 | `anchor_dedup_threshold` | Set to `None` to disable dedup. Reduce to 0.80 for stricter dedup. Increase to 0.90 for looser dedup. |
 | `normalize_embeddings` | Enable when documents and keyphrases have very different lengths (improves GMM robustness). |
+
+### 5.3 Global keyphrase extraction (`keyphrase_scope="global"`)
+
+By default (`keyphrase_scope="per_document"`), `kp_algorithm="keybert"` runs
+KeyBERT once per document and pools the results. `keyphrase_scope="global"`
+instead builds one shared candidate vocabulary for the whole corpus (via
+`CountVectorizer`, already filtered by `min_anchor_df`/`max_anchor_df_ratio`)
+and ranks it once against every document — each unique candidate is embedded
+once rather than once per document it appears in, typically 2.5-3.5x faster
+on medium/large corpora. Only affects `kp_algorithm="keybert"`; other
+algorithms ignore it.
+
+```python
+model = KATM(
+    n_topics=10,
+    kp_algorithm="keybert",
+    keyphrase_scope="global",
+    n_keyphrases_total=500,      # total anchor budget for the whole corpus
+    global_ranking_mode="top_k_average",  # or "membership"
+)
+model.fit(documents)
+```
+
+- `n_keyphrases_total` replaces `n_keyphrases` as the budget in this mode —
+  there's no single best value; it's cheap to sweep since candidates
+  already surviving the frequency filter are nearly free to rank.
+- `global_ranking_mode="membership"` ranks candidates by how many
+  documents' own top-N they appear in (a vote count) instead of averaging
+  similarity across a fixed window of `global_top_k_docs` documents. Worth
+  trying when your corpus has a narrow-but-real subtopic (e.g. a specific
+  medication or model name) that `"top_k_average"` under-serves because too
+  few documents mention it to fill the averaging window without dilution.
+- Because the anchor pool here is `n_keyphrases_total` words rather than a
+  per-document-dedup pool, it's often much larger — consider
+  `gmm_covariance_type="diag"` alongside it (see 5.1) if `GMMTopicClusterer`
+  numerics look unstable (e.g. `topics_` empty, or extreme BIC/AIC values).
+
+`long_document_strategy="chunk"` (works with either scope) fixes a related
+issue: KeyBERT/global-mode ranking by default scores each document against
+one whole-document embedding, which `sentence-transformers` silently
+truncates at the model's `max_seq_length` (256 tokens for
+`all-MiniLM-L6-v2`). `"chunk"` splits any document exceeding that limit into
+sentence-packed chunks and scores by the maximum similarity across a
+document's own chunks instead — a no-op for documents that already fit, so
+it's a strict fix rather than a behavior change for short-document corpora.
 
 ---
 
@@ -238,7 +294,7 @@ model = KATM(
 import time
 from katm import KATM
 
-algorithms = ["keybert", "rake", "yake", "tfidf", "gsc"]
+algorithms = ["keybert", "rake", "yake", "tfidf"]
 
 for algo in algorithms:
     print(f"\n=== {algo.upper()} ===")
@@ -254,7 +310,6 @@ for algo in algorithms:
 
 **Typical trade-offs:**
 - **KeyBERT** — Best quality, slowest (requires transformer model load)
-- **GSC** — Excellent semantic coverage, slow (embeds candidates + sentences)
 - **RAKE** — Fast, works offline, can produce noisy short phrases
 - **YAKE** — Fast, good for short documents, sensitive to boilerplate text
 - **TF-IDF** — Fastest, corpus-aware (down-weights generic words via IDF), reliable on short docs
