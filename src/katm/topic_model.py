@@ -45,6 +45,7 @@ class KATM:
         global_ranking_mode: str = "top_k_average",
         global_membership_n_per_doc: int = 10,
         long_document_strategy: str = "truncate",
+        compute_doc_topic_probs: bool = False,
     ):
         """Initialize KATM model.
 
@@ -157,6 +158,27 @@ class KATM:
                 magnitude variance. Makes ``GMM.predict_proba`` valid for
                 out-of-distribution inputs (documents vs keyphrases). Default
                 False to preserve backward compatibility.
+            compute_doc_topic_probs: False (default - CHANGES PRIOR BEHAVIOR,
+                unlike every other flag in this class). When False, fit()
+                skips Step 8 (encoding every document again and taking
+                cosine similarity to each topic centroid) entirely -
+                doc_topic_probs_ is left as an empty list, and fit_transform
+                returns an all-zero array instead. topics_/get_topic_words
+                are completely unaffected either way - Step 8 runs strictly
+                after project_vocabulary (Step 7) has already fully
+                determined every topic's word list, so nothing about the
+                topics themselves depends on this flag. Measured on a real
+                250-document novel at 34.5% of total fit() time - the
+                second-largest cost in the whole pipeline after keyphrase
+                extraction itself, for output (doc_topic_probs_) that plain
+                topic-word evaluation never reads. Set True to restore the
+                original behavior - needed for anything that scores or uses
+                per-document topic assignments (e.g. OCTIS-style evaluation
+                harnesses, or pulling exemplar documents per topic).
+                transform() (scoring NEW documents after fit()) is
+                unaffected by this flag either way - it always recomputes
+                fresh from the fitted centroids, independent of
+                doc_topic_probs_.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -186,6 +208,7 @@ class KATM:
         self.global_ranking_mode = global_ranking_mode
         self.global_membership_n_per_doc = global_membership_n_per_doc
         self.long_document_strategy = long_document_strategy
+        self.compute_doc_topic_probs = compute_doc_topic_probs
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -329,14 +352,29 @@ class KATM:
         # relative to topic anchor regions regardless of what phrases were
         # extracted from it. GMM posteriors are unreliable when training
         # (short phrases) and prediction (long documents) distributions differ.
-        doc_embeddings = self._maybe_normalize(embedder.encode(documents, batch_size=32))
-        centroids = clusterer.cluster_centers_
-        # Shape: (n_docs, n_topics)
-        sim_to_centroids = cosine_similarity(doc_embeddings, centroids)
-        # Softmax to convert similarities to a probability distribution
-        exp_sim = np.exp(sim_to_centroids - sim_to_centroids.max(axis=1, keepdims=True))
-        doc_probs = exp_sim / exp_sim.sum(axis=1, keepdims=True)
-        self.doc_topic_probs_ = list(doc_probs)
+        #
+        # Gated behind compute_doc_topic_probs (default False - changes prior
+        # behavior, see __init__ docstring): this step touches nothing topics_
+        # depends on (project_vocabulary, Step 7 above, already fully
+        # determined self.topics_ before this point) - it exists only to
+        # populate doc_topic_probs_ / support transform()'s style of lookup
+        # for individual fitted documents. Measured at 34.5% of total fit()
+        # time on a real 250-document novel - by far the second-largest cost
+        # after keyphrase extraction itself, for a value plain topic-word
+        # evaluation never reads. Still a real, used feature elsewhere (e.g.
+        # OCTIS-style evaluation harnesses that score document-topic
+        # assignments) - just not one every caller needs paid for by default.
+        if self.compute_doc_topic_probs:
+            doc_embeddings = self._maybe_normalize(embedder.encode(documents, batch_size=32))
+            centroids = clusterer.cluster_centers_
+            # Shape: (n_docs, n_topics)
+            sim_to_centroids = cosine_similarity(doc_embeddings, centroids)
+            # Softmax to convert similarities to a probability distribution
+            exp_sim = np.exp(sim_to_centroids - sim_to_centroids.max(axis=1, keepdims=True))
+            doc_probs = exp_sim / exp_sim.sum(axis=1, keepdims=True)
+            self.doc_topic_probs_ = list(doc_probs)
+        else:
+            self.doc_topic_probs_ = []
 
         self._n_fitted_docs = len(documents)
 
@@ -392,7 +430,13 @@ class KATM:
         """
         self.fit(documents)
         if not self.doc_topic_probs_:
-            return np.zeros((0, self.n_topics))
+            # Two different reasons doc_topic_probs_ can be empty: no
+            # documents were fit at all (shape (0, n_topics) is correct), or
+            # documents WERE fit but compute_doc_topic_probs=False skipped
+            # Step 8 (the shape should still reflect the real n_docs, filled
+            # with zeros, matching this method's own documented return
+            # shape (n_docs, n_topics) - not silently collapse to 0 rows).
+            return np.zeros((self._n_fitted_docs, self.n_topics))
         return np.array(self.doc_topic_probs_)
 
     def get_topic_words(self, topic_id: int, n: Optional[int] = None) -> List[Tuple[str, float]]:

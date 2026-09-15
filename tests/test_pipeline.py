@@ -72,6 +72,7 @@ def test_katm_fit():
         min_anchor_df=1,
         max_anchor_df_ratio=1.0,
         anchor_dedup_threshold=None,
+        compute_doc_topic_probs=True,
     )
     model.fit(CORPUS)
 
@@ -210,6 +211,7 @@ def test_katm_global_keyphrase_scope():
         anchor_dedup_threshold=None,
         keyphrase_scope="global",
         n_keyphrases_total=50,
+        compute_doc_topic_probs=True,
     )
     model.fit(CORPUS)
 
@@ -231,6 +233,7 @@ def test_katm_global_keyphrase_scope_membership_ranking():
         global_ranking_mode="membership",
         global_membership_n_per_doc=5,
         gmm_covariance_type="diag",
+        compute_doc_topic_probs=True,
     )
     model.fit(CORPUS)
 
@@ -252,6 +255,7 @@ def test_katm_global_keyphrase_scope_ignored_for_non_keybert():
         anchor_dedup_threshold=None,
         kp_algorithm="rake",
         keyphrase_scope="global",
+        compute_doc_topic_probs=True,
     )
     model.fit(CORPUS)
 
@@ -374,6 +378,7 @@ def test_katm_long_document_strategy_chunk_end_to_end():
         max_anchor_df_ratio=1.0,
         anchor_dedup_threshold=None,
         long_document_strategy="chunk",
+        compute_doc_topic_probs=True,
     )
     model.fit(corpus)
 
@@ -382,6 +387,37 @@ def test_katm_long_document_strategy_chunk_end_to_end():
 
 
 # ── keybert_use_mmr ───────────────────────────────────────────────────────
+
+
+def test_katm_compute_doc_topic_probs_default_off():
+    # compute_doc_topic_probs defaults to False - Step 8 is skipped, so
+    # doc_topic_probs_ stays empty and fit_transform falls back to a
+    # correctly-shaped (n_docs, n_topics) zero array rather than (0, n_topics).
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+    )
+    result = model.fit_transform(CORPUS)
+
+    assert model.doc_topic_probs_ == []
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (len(CORPUS), N_TOPICS)
+    assert np.all(result == 0)
+
+    # topics_ (word lists) must be entirely unaffected by the flag.
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) > 0
+
+    # transform() on new documents is independent of compute_doc_topic_probs
+    # and must still produce a real (non-zero) probability distribution.
+    transformed = model.transform(CORPUS)
+    assert transformed.shape == (len(CORPUS), N_TOPICS)
+    assert np.allclose(transformed.sum(axis=1), 1.0)
 
 
 def test_katm_keybert_use_mmr():
@@ -395,6 +431,7 @@ def test_katm_keybert_use_mmr():
         anchor_dedup_threshold=None,
         keybert_use_mmr=True,
         keybert_diversity=0.6,
+        compute_doc_topic_probs=True,
     )
     model.fit(CORPUS)
 
