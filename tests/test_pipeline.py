@@ -17,7 +17,7 @@ from katm import (
 from katm.topic_assignment import WordTopicProjector
 from katm.global_keyphrases import extract_global_keyphrases
 from katm.keyphrase_extractor import _chunk_text_for_embedding
-from katm.utils import _stopwords_for
+from katm.utils import _stopwords_for, build_noun_final_vocab, extract_content_words
 
 
 # Synthetic corpus: 5 documents on distinct topics.
@@ -602,3 +602,79 @@ def test_stopwords_for_unsupported_language_falls_back_to_english():
     # No NLTK stopword corpus exists for this code - should fall back to
     # the English list rather than raising.
     assert _stopwords_for("not-a-real-language") == _stopwords_for("english")
+
+
+# ── keybert_candidate_pos_filter / content_pos_filter ────────────────────
+
+
+def test_build_noun_final_vocab_restricts_to_noun_final_ngrams():
+    docs = ["The tall captain quickly escaped clouded skies."]
+    vocab = build_noun_final_vocab(docs, "english", (1, 2))
+
+    assert isinstance(vocab, set)
+    assert len(vocab) > 0
+    # "captain" and "skies" are noun-final; "quickly"/"escaped"/"clouded"
+    # (adverb/verb/adjective-final) must not appear as unigram candidates.
+    assert "captain" in vocab
+    assert "skies" in vocab
+    assert "quickly" not in vocab
+    assert "escaped" not in vocab
+
+
+def test_katm_keybert_candidate_pos_filter_end_to_end():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        keybert_candidate_pos_filter=True,
+    )
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) > 0
+
+
+def test_extract_global_keyphrases_candidate_pos_filter():
+    embedder = SentenceEmbedder()
+    keyphrases = extract_global_keyphrases(
+        CORPUS, embedder, keybert_ngram_range=(1, 2), language="english",
+        min_anchor_df=1, max_anchor_df_ratio=1.0, n_keyphrases_total=15,
+        candidate_pos_filter=True,
+    )
+    assert isinstance(keyphrases, list)
+    assert len(keyphrases) > 0
+
+
+def test_extract_content_words_spacy_paper_restricted():
+    default_words = extract_content_words(CORPUS, min_df=1, method="spacy")
+    restricted_words = extract_content_words(
+        CORPUS, min_df=1, method="spacy", pos_filter="paper_restricted",
+    )
+
+    assert isinstance(restricted_words, list)
+    assert len(restricted_words) > 0
+    # paper_restricted (nouns/adjectives/finite verbs only) must not be a
+    # superset of the broader default (which also allows ADV and non-finite
+    # verb forms) - it's expected to be a different, typically smaller set.
+    assert set(restricted_words) != set(default_words)
+
+
+def test_katm_content_pos_filter_end_to_end():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        content_words_method="spacy",
+        content_pos_filter="paper_restricted",
+    )
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)

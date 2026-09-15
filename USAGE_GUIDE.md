@@ -230,6 +230,9 @@ model = KATM(
     centroid_mode="mean",            # "mean" | "max" | "top_k_anchors" | "blend"
     centroid_blend_alpha=0.5,        # centroid_mode="blend" only
     centroid_top_k=3,                # centroid_mode="top_k_anchors" only
+    keybert_candidate_pos_filter=False,  # Restrict KeyBERT candidates to noun-final phrases
+    content_pos_filter=None,         # None or "paper_restricted" (content_words_method="spacy" only)
+    exclude_abstract_suffixes=False, # German-only, keyphrase_scope="global" only
 )
 ```
 
@@ -247,6 +250,8 @@ model = KATM(
 | `normalize_embeddings` | Enable when documents and keyphrases have very different lengths (improves GMM robustness). |
 | `centroid_mode` | A topic mixes a tight, repetitive anchor subgroup with a scattered one and the word list underrepresents the scattered subgroup → try `"max"`, `"top_k_anchors"`, or `"blend"` instead of `"mean"`. |
 | `lemma_dedup` | A topic's word list shows near-duplicate inflections of the same word (e.g. "running"/"run") that `mmr_max_sim` didn't catch. |
+| `keybert_candidate_pos_filter` | Topics look like grammatical/register clusters (all speech verbs, all reproach words) instead of subject-matter clusters. |
+| `content_pos_filter="paper_restricted"` | Same symptom as above but on literary/narrative prose specifically — restricts to nouns, adjectives, and finite lexical verbs only (Uglanova & Gius 2020). |
 
 ### 5.3 Global keyphrase extraction (`keyphrase_scope="global"`)
 
@@ -292,6 +297,43 @@ truncates at the model's `max_seq_length` (256 tokens for
 sentence-packed chunks and scores by the maximum similarity across a
 document's own chunks instead — a no-op for documents that already fit, so
 it's a strict fix rather than a behavior change for short-document corpora.
+
+### 5.5 Restricting to grammatical classes (`keybert_candidate_pos_filter`, `content_pos_filter`)
+
+On some corpora — especially literary/narrative prose — the default broad
+POS set lets a cluster form around a *grammatical register* instead of a
+*subject*: e.g. a topic that's just "all speech-act verbs" or "all reproach
+words," tight and low-overlap but not about anything. Two independent knobs
+target this, at the two different points a word can enter a topic:
+
+```python
+model = KATM(
+    n_topics=5,
+    kp_algorithm="keybert",
+    keybert_candidate_pos_filter=True,   # restrict KeyBERT's own candidates
+    content_words_method="spacy",
+    content_pos_filter="paper_restricted",  # restrict the displayed word list
+)
+model.fit(documents)
+```
+
+- `keybert_candidate_pos_filter=True` restricts KeyBERT's own candidate
+  generation to right-headed noun phrases (last token NOUN/PROPN) — e.g.
+  "captain" and "aeroplane" pass, "quickly escaped" doesn't. This matters
+  because filtering only the *displayed* word list afterward still leaves
+  the anchor pool (and therefore the GMM cluster centroids themselves) full
+  of non-noun-final candidates. Works for any `keyphrase_scope`
+  (`per_document` and `global` both honor it).
+- `content_pos_filter="paper_restricted"` (only with
+  `content_words_method="spacy"`) restricts the topic word list itself to
+  nouns, adjectives, and finite lexical verbs — the restriction from
+  Uglanova & Gius 2020, developed for German literary prose but with a
+  hand-mapped English/French equivalent. `None` (default) keeps the
+  broader {NOUN, VERB, ADJ, ADV, PROPN} set.
+
+These two are independent — use either alone or together depending on
+whether the register-clustering problem shows up in the anchors, the
+displayed words, or both.
 
 ---
 

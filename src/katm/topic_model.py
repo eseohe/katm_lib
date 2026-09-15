@@ -50,6 +50,9 @@ class KATM:
         centroid_mode: str = "mean",
         centroid_blend_alpha: float = 0.5,
         centroid_top_k: int = 3,
+        keybert_candidate_pos_filter: bool = False,
+        content_pos_filter: "str | None" = None,
+        exclude_abstract_suffixes: bool = False,
     ):
         """Initialize KATM model.
 
@@ -208,6 +211,32 @@ class KATM:
             centroid_top_k: Number of nearest anchors averaged when
                 centroid_mode="top_k_anchors". Default 3. Unused for other
                 modes.
+            keybert_candidate_pos_filter: If True and kp_algorithm="keybert"
+                (any keyphrase_scope), restricts candidate generation to
+                right-headed noun phrases (last token NOUN/PROPN) via
+                utils.build_noun_final_vocab — see KeyphraseExtractor's own
+                docstring for the full rationale (fixes grammatical/
+                register-class clusters like "all speech verbs" forming
+                instead of subject-matter ones). Default False, fully
+                backward-compatible.
+            content_pos_filter: None (default, unchanged behavior — the
+                broad {NOUN, VERB, ADJ, ADV, PROPN} set) or
+                "paper_restricted" (NN/ADJA/ADJD/VVFIN per Uglanova & Gius
+                2020 — nouns, adjectives, and finite lexical verbs only).
+                Only affects content_words_method="spacy"; silently ignored
+                for "tfidf" (no POS tags available). Particularly relevant
+                for literary/narrative prose, where the broader POS set can
+                produce grammatical-register topics (all speech-act verbs,
+                all reproach words) rather than subject-matter ones. See
+                utils.extract_content_words's docstring for the mechanism.
+            exclude_abstract_suffixes: Only used when
+                keyphrase_scope="global" (passed through to
+                global_keyphrases.extract_global_keyphrases's candidate
+                vectorizer). If True, additionally drops any candidate
+                whose head ends in a German abstract-nominalization suffix
+                (see utils._GERMAN_ABSTRACT_SUFFIXES). Experimental; no-op
+                for language != "german" regardless of this flag. Default
+                False.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -242,6 +271,9 @@ class KATM:
         self.centroid_mode = centroid_mode
         self.centroid_blend_alpha = centroid_blend_alpha
         self.centroid_top_k = centroid_top_k
+        self.keybert_candidate_pos_filter = keybert_candidate_pos_filter
+        self.content_pos_filter = content_pos_filter
+        self.exclude_abstract_suffixes = exclude_abstract_suffixes
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -282,6 +314,11 @@ class KATM:
                 top_k_docs=self.global_top_k_docs,
                 ranking_mode=self.global_ranking_mode,
                 membership_n_per_doc=self.global_membership_n_per_doc,
+                # Reuses the same flag the "per_document" path uses for its
+                # own candidate-generation POS restriction - one flag, same
+                # meaning, regardless of keyphrase_scope.
+                candidate_pos_filter=self.keybert_candidate_pos_filter,
+                exclude_abstract_suffixes=self.exclude_abstract_suffixes,
             )
         else:
             # Extract keyphrases (pass embedder._model to avoid a second load)
@@ -294,9 +331,11 @@ class KATM:
                 yake_use_position=self.yake_use_position,
                 tfidf_ngram_range=self.tfidf_ngram_range,
                 keybert_ngram_range=self.keybert_ngram_range,
+                keybert_candidate_pos_filter=self.keybert_candidate_pos_filter,
                 keybert_use_mmr=self.keybert_use_mmr,
                 keybert_diversity=self.keybert_diversity,
                 keybert_stop_words=kp_stop_words,
+                language=self.language,
                 long_document_strategy=self.long_document_strategy,
             )
             doc_keyphrases = kp_extractor.extract(documents)
@@ -366,7 +405,9 @@ class KATM:
 
         # Step 6: Extract content words from all documents
         content_words = extract_content_words(documents, min_df=self.min_df,
-                                               method=self.content_words_method)
+                                               method=self.content_words_method,
+                                               language=self.language,
+                                               pos_filter=self.content_pos_filter)
 
         # Step 7: Project vocabulary onto clusters
         if content_words:

@@ -54,6 +54,8 @@ def extract_global_keyphrases(
     top_k_docs: "int | None" = None,
     ranking_mode: str = "top_k_average",
     membership_n_per_doc: int = 10,
+    candidate_pos_filter: bool = False,
+    exclude_abstract_suffixes: bool = False,
 ) -> List[str]:
     """
     Args:
@@ -84,6 +86,26 @@ def extract_global_keyphrases(
             size of each document's own top-N window when counting
             membership votes (see below), mirroring per-document mode's own
             n_keyphrases default of 10.
+        candidate_pos_filter: False (default, unchanged behavior - plain
+            CountVectorizer candidates, stop-word-filtered only). If True,
+            restricts the candidate pool itself to right-headed noun
+            phrases (last token NOUN/PROPN) before ranking - the global-
+            scope equivalent of keyphrase_scope="per_document"'s own
+            keybert_candidate_pos_filter (see utils.build_noun_final_vocab
+            and KeyphraseExtractor._noun_final_candidate_vectorizer's
+            docstrings for the original diagnosis: grammatical/register-
+            class topics forming because the anchor pool itself was full of
+            non-noun-final candidates, not just the displayed word list).
+            min_anchor_df/max_anchor_df_ratio are still applied, just by
+            hand on the resulting document-term matrix rather than via
+            CountVectorizer's own min_df/max_df (which are silently ignored
+            whenever a fixed `vocabulary=` is supplied).
+        exclude_abstract_suffixes: False (default). Only has any effect
+            when candidate_pos_filter=True and language="german" - passed
+            straight through to utils.build_noun_final_vocab (see its own
+            docstring): additionally drops German candidates headed by a
+            word ending in a productive abstract-nominalization suffix.
+            Experimental.
     """
     from sklearn.feature_extraction.text import CountVectorizer
     from .utils import _stopwords_for as _kp_stopwords_for
@@ -96,17 +118,42 @@ def extract_global_keyphrases(
     # min_anchor_df larger than the corpus itself (tiny corpora).
     min_df = min(min_df, n_docs)
 
-    cv = CountVectorizer(
-        ngram_range=keybert_ngram_range, stop_words=kp_stop_words,
-        min_df=min_df, max_df=max_df, token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z\-]+\b",
-    )
-    try:
-        cv.fit(documents)
-    except ValueError:
-        return []  # empty vocabulary after frequency filtering
-    candidates = list(cv.get_feature_names_out())
-    if not candidates:
-        return []
+    if candidate_pos_filter:
+        # Opt-in test of the per-document path's own fix (see
+        # KeyphraseExtractor._noun_final_candidate_vectorizer /
+        # utils.build_noun_final_vocab): restrict the candidate pool itself
+        # to right-headed noun phrases before anything is ranked, instead
+        # of the plain CountVectorizer's stop-word-only filter below. A
+        # fixed `vocabulary=` bypasses sklearn's own min_df/max_df pruning
+        # entirely, so that filter is re-applied by hand here on the
+        # resulting document-term matrix - same threshold semantics as the
+        # unrestricted branch just below.
+        from .utils import build_noun_final_vocab
+        vocab = build_noun_final_vocab(documents, language, keybert_ngram_range,
+                                        exclude_abstract_suffixes=exclude_abstract_suffixes)
+        if not vocab:
+            return []  # no noun-final candidates found; caller sees an empty pool
+        cv = CountVectorizer(vocabulary=sorted(vocab), ngram_range=keybert_ngram_range,
+                              token_pattern=r"(?u)\b\w+\b")
+        counts = cv.fit_transform(documents)
+        doc_freq = np.asarray((counts > 0).sum(axis=0)).ravel()
+        max_df_count = max_df * n_docs
+        keep = (doc_freq >= min_df) & (doc_freq <= max_df_count)
+        candidates = [w for w, k in zip(cv.get_feature_names_out(), keep) if k]
+        if not candidates:
+            return []
+    else:
+        cv = CountVectorizer(
+            ngram_range=keybert_ngram_range, stop_words=kp_stop_words,
+            min_df=min_df, max_df=max_df, token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z\-]+\b",
+        )
+        try:
+            cv.fit(documents)
+        except ValueError:
+            return []  # empty vocabulary after frequency filtering
+        candidates = list(cv.get_feature_names_out())
+        if not candidates:
+            return []
 
     # Chunk each document (sentence-packed, token-budget-limited — see module
     # docstring) so no document is silently truncated at the embedding

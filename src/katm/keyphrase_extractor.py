@@ -191,7 +191,8 @@ class KeyphraseExtractor:
                  yake_use_position: bool = False, tfidf_ngram_range: tuple = (1, 2),
                  keybert_ngram_range: tuple = (1, 2), keybert_use_mmr: bool = False,
                  keybert_diversity: float = 0.5, keybert_stop_words="english",
-                 long_document_strategy: str = "truncate"):
+                 long_document_strategy: str = "truncate", language: str = "english",
+                 keybert_candidate_pos_filter: bool = False):
         """Initialize KeyphraseExtractor.
 
         Args:
@@ -236,6 +237,31 @@ class KeyphraseExtractor:
                 (identical output to "truncate") for any document that
                 already fits within max_seq_length, so switching this on is a
                 strict fix, never a regression, for short documents.
+            language: "english" (default), "german", or "french". Only used
+                when keybert_candidate_pos_filter=True (selects the spaCy
+                model for build_noun_final_vocab) and, when "german",
+                additionally drops any extracted keyphrase containing a
+                non-German-alphabet character after extraction - a cheap,
+                targeted fix for foreign-script tokens leaking into the
+                anchor pool via a compressed-embedding-space false-
+                similarity match.
+            keybert_candidate_pos_filter: If True and algorithm="keybert",
+                restricts KeyBERT's own candidate generation to right-headed
+                noun phrases (last token NOUN/PROPN) via
+                utils.build_noun_final_vocab, instead of letting KeyBERT
+                consider every n-gram. Filtering only the final display
+                vocabulary afterward leaves the anchor pool - and therefore
+                the GMM cluster centroids - full of pure-verb/adverb
+                candidates, which produces register/grammatical-class
+                topics (all speech verbs, all reproach words) instead of
+                subject-matter ones; restricting candidate generation
+                itself is the fix. Default False, fully backward-
+                compatible. Falls back to KeyBERT's own default vectorizer
+                if build_noun_final_vocab finds no noun-final n-grams at all
+                (e.g. a very short/degenerate corpus), rather than silently
+                producing zero candidates. Only affects
+                long_document_strategy="truncate" - not yet wired into the
+                "chunk" path.
 
         Raises:
             ValueError: If algorithm is not recognized.
@@ -258,6 +284,8 @@ class KeyphraseExtractor:
         self._keybert_diversity = keybert_diversity
         self._keybert_stop_words = keybert_stop_words
         self._long_document_strategy = long_document_strategy
+        self._language = language
+        self._keybert_candidate_pos_filter = keybert_candidate_pos_filter
         self._keybert_model = None
         self._yake_extractor = None
 
@@ -284,6 +312,21 @@ class KeyphraseExtractor:
 
         return []
 
+    def _noun_final_candidate_vectorizer(self, documents: List[str]):
+        """Build a CountVectorizer whose fixed vocabulary is restricted to
+        n-grams that are right-headed noun phrases - see
+        utils.build_noun_final_vocab's docstring for the full rationale.
+        """
+        from sklearn.feature_extraction.text import CountVectorizer
+        from .utils import build_noun_final_vocab
+
+        vocab = build_noun_final_vocab(documents, self._language, self._keybert_ngram_range)
+
+        if not vocab:
+            return None  # caller falls back to KeyBERT's own default vectorizer
+        return CountVectorizer(vocabulary=sorted(vocab), ngram_range=self._keybert_ngram_range,
+                                token_pattern=r"(?u)\b\w+\b")
+
     def _extract_keybert(self, documents: List[str]) -> List[List[str]]:
         """Extract keyphrases using KeyBERT."""
         try:
@@ -295,29 +338,38 @@ class KeyphraseExtractor:
             self._keybert_model = KeyBERT(model=self._pretrained_model)
 
         if self._long_document_strategy == "chunk":
-            return self._extract_keybert_chunked(documents)
+            phrases = self._extract_keybert_chunked(documents)
+        else:
+            # Pass the full corpus in one call so KeyBERT encodes all candidates
+            # in a single batched model.encode() rather than one call per document.
+            extract_kwargs = dict(
+                keyphrase_ngram_range=self._keybert_ngram_range,
+                top_n=self.n_keyphrases,
+                stop_words=self._keybert_stop_words,
+            )
+            if self._keybert_candidate_pos_filter:
+                custom_vectorizer = self._noun_final_candidate_vectorizer(documents)
+                if custom_vectorizer is not None:
+                    extract_kwargs["vectorizer"] = custom_vectorizer
+                    extract_kwargs.pop("stop_words", None)  # already applied via is_stop above
+            if self._keybert_use_mmr:
+                extract_kwargs["use_mmr"] = True
+                extract_kwargs["diversity"] = self._keybert_diversity
+            all_keywords = self._keybert_model.extract_keywords(documents, **extract_kwargs)
+            # KeyBERT silently unwraps its own return value for a batch of exactly
+            # one document ([[(kw, score), ...]] -> [(kw, score), ...]) - re-wrap
+            # so downstream code can always assume one list per document
+            # regardless of how many documents were passed in. Not a behavior
+            # change for KATM's normal usage (always called with the full
+            # document batch), but a real bug for a single-document call.
+            if len(documents) == 1 and all_keywords and isinstance(all_keywords[0], tuple):
+                all_keywords = [all_keywords]
+            phrases = [[kp for kp, _ in doc_kws] for doc_kws in all_keywords]
 
-        # Pass the full corpus in one call so KeyBERT encodes all candidates
-        # in a single batched model.encode() rather than one call per document.
-        extract_kwargs = dict(
-            keyphrase_ngram_range=self._keybert_ngram_range,
-            top_n=self.n_keyphrases,
-            stop_words=self._keybert_stop_words,
-        )
-        if self._keybert_use_mmr:
-            extract_kwargs["use_mmr"] = True
-            extract_kwargs["diversity"] = self._keybert_diversity
-        all_keywords = self._keybert_model.extract_keywords(documents, **extract_kwargs)
-        # KeyBERT silently unwraps its own return value for a batch of exactly
-        # one document ([[(kw, score), ...]] -> [(kw, score), ...]) - re-wrap
-        # so downstream code can always assume one list per document
-        # regardless of how many documents were passed in. Not a behavior
-        # change for KATM's normal usage (always called with the full
-        # document batch), but a real bug for a single-document call.
-        if len(documents) == 1 and all_keywords and isinstance(all_keywords[0], tuple):
-            all_keywords = [all_keywords]
-
-        return [[kp for kp, _ in doc_kws] for doc_kws in all_keywords]
+        if self._language == "german":
+            from .utils import _is_german_alphabet
+            phrases = [[p for p in doc_phrases if _is_german_alphabet(p)] for doc_phrases in phrases]
+        return phrases
 
     def _extract_keybert_chunked(self, documents: List[str]) -> List[List[str]]:
         """long_document_strategy="chunk" — see __init__'s docstring for the
