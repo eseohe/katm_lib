@@ -233,6 +233,8 @@ model = KATM(
     keybert_candidate_pos_filter=False,  # Restrict KeyBERT candidates to noun-final phrases
     content_pos_filter=None,         # None or "paper_restricted" (content_words_method="spacy" only)
     exclude_abstract_suffixes=False, # German-only, keyphrase_scope="global" only
+    contextual_anchor_embedding=False,  # Embed anchors from real occurrences, not bare strings
+    contextual_max_occurrences=20,   # contextual_anchor_embedding=True only
 )
 ```
 
@@ -252,6 +254,7 @@ model = KATM(
 | `lemma_dedup` | A topic's word list shows near-duplicate inflections of the same word (e.g. "running"/"run") that `mmr_max_sim` didn't catch. |
 | `keybert_candidate_pos_filter` | Topics look like grammatical/register clusters (all speech verbs, all reproach words) instead of subject-matter clusters. |
 | `content_pos_filter="paper_restricted"` | Same symptom as above but on literary/narrative prose specifically — restricts to nouns, adjectives, and finite lexical verbs only (Uglanova & Gius 2020). |
+| `contextual_anchor_embedding` | Two semantically unrelated anchors merge into one topic because a short polysemous phrase (e.g. a character's nickname) embeds toward its generic dictionary sense instead of how it's actually used in your corpus. |
 
 ### 5.3 Global keyphrase extraction (`keyphrase_scope="global"`)
 
@@ -298,7 +301,7 @@ sentence-packed chunks and scores by the maximum similarity across a
 document's own chunks instead — a no-op for documents that already fit, so
 it's a strict fix rather than a behavior change for short-document corpora.
 
-### 5.5 Restricting to grammatical classes (`keybert_candidate_pos_filter`, `content_pos_filter`)
+### 5.4 Restricting to grammatical classes (`keybert_candidate_pos_filter`, `content_pos_filter`)
 
 On some corpora — especially literary/narrative prose — the default broad
 POS set lets a cluster form around a *grammatical register* instead of a
@@ -337,7 +340,7 @@ displayed words, or both.
 
 ---
 
-### 5.4 Choosing `n_topics` with `select_n_topics`
+### 5.5 Choosing `n_topics` with `select_n_topics`
 
 KATM has no automatic `n_topics="auto"` mode — you must pass an explicit
 `n_topics`. `select_n_topics` is a standalone diagnostic to help you pick
@@ -365,6 +368,33 @@ model.fit(documents)
 `method` is `"bic"` (default), `"aic"`, `"elbow"`, or `"silhouette"` — see
 the function's docstring for the trade-offs. `scores` keeps every k's raw
 BIC/AIC (and silhouette, if requested) for plotting or manual inspection.
+
+### 5.6 Disambiguating polysemous anchors (`contextual_anchor_embedding`)
+
+By default, an anchor keyphrase is embedded as a bare, isolated string — a
+short polysemous word/phrase (e.g. "kitty" as a character's nickname) then
+embeds toward its generic dictionary sense (a young cat) regardless of how
+it's actually used in your corpus, which can merge two semantically
+unrelated anchors into the same GMM topic.
+
+```python
+model = KATM(
+    n_topics=5,
+    contextual_anchor_embedding=True,
+    contextual_max_occurrences=20,  # cap per anchor; default is usually fine
+)
+model.fit(documents)
+```
+
+With this on, each anchor is instead embedded from its actual occurrences
+across the fitted documents (the containing sentence of each occurrence,
+averaged) — letting the surrounding sentence disambiguate the sense the
+same way a human reader would. Falls back to the isolated-phrase embedding
+for any anchor whose exact surface form isn't found in any document
+(rare). This costs an extra O(n_anchors × n_docs) substring search plus one
+more `encode()` pass, so it's opt-in — turn it on when anchor quality
+matters more than fit time, e.g. on literary/narrative prose where names,
+nicknames, and place-name fragments are common.
 
 ## 6. Compare Keyphrase Extractors
 
@@ -620,7 +650,7 @@ model = KATM(
     n_topics=8,
     language="german",
     kp_algorithm="rake",              # or "yake"/"tfidf" - "keybert" also honors language
-    content_words_method="spacy",     # required for content_pos_filter, see 5.5
+    content_words_method="spacy",     # required for content_pos_filter, see 5.4
     content_pos_filter="paper_restricted",  # recommended for literary/narrative prose
 )
 model.fit(german_documents)

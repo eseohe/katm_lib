@@ -53,6 +53,8 @@ class KATM:
         keybert_candidate_pos_filter: bool = False,
         content_pos_filter: "str | None" = None,
         exclude_abstract_suffixes: bool = False,
+        contextual_anchor_embedding: bool = False,
+        contextual_max_occurrences: int = 20,
     ):
         """Initialize KATM model.
 
@@ -243,6 +245,28 @@ class KATM:
                 (see utils._GERMAN_ABSTRACT_SUFFIXES). Experimental; no-op
                 for language != "german" regardless of this flag. Default
                 False.
+            contextual_anchor_embedding: False (default, unchanged behavior
+                - every anchor keyphrase is embedded as a bare, isolated
+                string). If True, each anchor is instead embedded from its
+                actual occurrences across the fitted documents (the
+                containing sentence of each occurrence, averaged), giving
+                it a contextualized embedding instead of one derived from
+                the phrase's own default/most-common sense in isolation.
+                Fixes a concrete failure mode: embedding a bare polysemous
+                word/phrase (e.g. "kitty" as a character's nickname) pulls
+                it toward that word's generic dictionary sense regardless
+                of how it's actually used in the corpus, which can merge
+                two semantically unrelated anchors into the same GMM
+                topic. Falls back to the isolated-phrase embedding for any
+                anchor whose exact surface form isn't found in any
+                document (should be rare). O(n_anchors x n_docs) substring
+                search plus one extra encode() pass - costs more than the
+                default, so opt in only where anchor quality matters more
+                than fit time.
+            contextual_max_occurrences: Cap on how many occurrences (across
+                all documents) are embedded and averaged per anchor when
+                contextual_anchor_embedding=True. Default 20 - keeps the
+                cost bounded for very common anchors. Ignored otherwise.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -280,6 +304,8 @@ class KATM:
         self.keybert_candidate_pos_filter = keybert_candidate_pos_filter
         self.content_pos_filter = content_pos_filter
         self.exclude_abstract_suffixes = exclude_abstract_suffixes
+        self.contextual_anchor_embedding = contextual_anchor_embedding
+        self.contextual_max_occurrences = contextual_max_occurrences
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -374,10 +400,21 @@ class KATM:
             self.doc_topic_probs_ = []
             return self
 
-        # Step 4: Embed keyphrases
-        keyphrase_embeddings = self._maybe_normalize(
-            embedder.encode(all_keyphrases, batch_size=32)
-        )
+        # Step 4: Embed keyphrases. Default: bare phrase string, in
+        # isolation, as before. contextual_anchor_embedding=True instead
+        # embeds each phrase's actual occurrences-in-context and averages
+        # them - see _contextual_embed_keyphrases's docstring for why.
+        if self.contextual_anchor_embedding:
+            keyphrase_embeddings = self._maybe_normalize(
+                _contextual_embed_keyphrases(
+                    all_keyphrases, documents, embedder,
+                    max_occurrences=self.contextual_max_occurrences,
+                )
+            )
+        else:
+            keyphrase_embeddings = self._maybe_normalize(
+                embedder.encode(all_keyphrases, batch_size=32)
+            )
 
         # Step 4b: Greedy semantic deduplication of the anchor pool.
         # Processing in doc-frequency order means common phrases are kept as
@@ -597,6 +634,97 @@ class KATM:
                 print(f"\nTopic {topic_id}: (no words above threshold)")
 
         print(f"\n{'='*60}\n")
+
+
+def _contextual_embed_keyphrases(
+    phrases: List[str],
+    documents: List[str],
+    embedder,
+    max_occurrences: int = 20,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Embed each anchor phrase from its actual occurrences in `documents`
+    (the containing sentence of each occurrence, averaged) instead of from
+    the bare phrase string in isolation.
+
+    Motivation: embedding a short polysemous phrase with no surrounding
+    context pulls it toward that phrase's most common/default sense - e.g.
+    bare "kitty" embeds near "cat" - regardless of how the phrase is
+    actually used in the fitted corpus (a character's nickname). That
+    default-sense embedding is exactly what can merge two semantically
+    unrelated anchors into the same GMM topic. Embedding real occurrences-
+    in-context instead lets the surrounding sentence disambiguate the sense
+    the same way a human reader would.
+
+    Mechanism: for each phrase, find every sentence (across every document)
+    containing it as a whole-word match, embed each occurrence sentence
+    (capped at `max_occurrences`, first-found order - deterministic, not a
+    random sample), and average those embeddings. A phrase whose exact
+    surface form isn't found anywhere (should be rare - only possible if an
+    upstream extraction step normalized it away from its literal source
+    text) falls back to embedding the bare phrase string, so every anchor
+    still gets *some* embedding.
+
+    All occurrence sentences across all phrases are batched into ONE
+    embedder.encode() call (plus a second, smaller call for any bare-phrase
+    fallbacks), not one call per phrase - the expensive part is the
+    O(n_anchors x n_docs) substring search, done in pure Python, not the
+    embedding pass.
+
+    Returns:
+        (len(phrases), embedding_dim) array, same row order as `phrases` -
+        a drop-in replacement for embedder.encode(phrases).
+    """
+    import re
+    from nltk.tokenize import sent_tokenize
+
+    doc_sentences = [sent_tokenize(doc) for doc in documents]
+
+    flat_snippets: List[str] = []
+    snippet_owner: List[int] = []  # index into `phrases`, parallel to flat_snippets
+    n_found = [0] * len(phrases)
+
+    for pi, phrase in enumerate(phrases):
+        pattern = re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE)
+        for sents in doc_sentences:
+            if n_found[pi] >= max_occurrences:
+                break
+            for s in sents:
+                if n_found[pi] >= max_occurrences:
+                    break
+                if pattern.search(s):
+                    flat_snippets.append(s)
+                    snippet_owner.append(pi)
+                    n_found[pi] += 1
+
+    fallback_indices = [pi for pi in range(len(phrases)) if n_found[pi] == 0]
+
+    snippet_embs = embedder.encode(flat_snippets, batch_size=batch_size) if flat_snippets else None
+    fallback_embs = (
+        embedder.encode([phrases[pi] for pi in fallback_indices], batch_size=batch_size)
+        if fallback_indices else None
+    )
+
+    dim = (
+        snippet_embs.shape[1] if snippet_embs is not None
+        else fallback_embs.shape[1] if fallback_embs is not None
+        else 0
+    )
+    out = np.zeros((len(phrases), dim))
+
+    if snippet_embs is not None:
+        sums = np.zeros((len(phrases), dim))
+        for row_emb, pi in zip(snippet_embs, snippet_owner):
+            sums[pi] += row_emb
+        for pi in range(len(phrases)):
+            if n_found[pi] > 0:
+                out[pi] = sums[pi] / n_found[pi]
+
+    if fallback_embs is not None:
+        for row_emb, pi in zip(fallback_embs, fallback_indices):
+            out[pi] = row_emb
+
+    return out
 
 
 # ── S3: vectorized anchor deduplication ──────────────────────────────────────

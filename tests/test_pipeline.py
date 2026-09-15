@@ -649,6 +649,50 @@ def test_extract_content_words_tfidf_german_keeps_umlauts():
     assert any("ü" in w for w in words)
 
 
+# ── contextual_anchor_embedding ──────────────────────────────────────────
+
+
+def test_contextual_embed_keyphrases_averages_occurrences():
+    from katm.topic_model import _contextual_embed_keyphrases
+
+    docs = [
+        "The kitty played with a ball of yarn in the living room.",
+        "Later, the kitty curled up and slept on the warm windowsill.",
+    ]
+    embedder = SentenceEmbedder()
+    phrases = ["kitty", "nonexistent phrase"]
+    embs = _contextual_embed_keyphrases(phrases, docs, embedder, max_occurrences=20)
+
+    assert embs.shape[0] == len(phrases)
+    assert embs.shape[1] > 0
+    # "kitty" appears in both docs - its row must be the average of the two
+    # occurrence-sentence embeddings, not a bare-phrase embedding.
+    sent_embs = embedder.encode(docs, batch_size=32)
+    expected_kitty = sent_embs.mean(axis=0)
+    assert np.allclose(embs[0], expected_kitty, atol=1e-5)
+    # A phrase with no occurrences must fall back to the bare-phrase embedding.
+    fallback_emb = embedder.encode(["nonexistent phrase"], batch_size=32)[0]
+    assert np.allclose(embs[1], fallback_emb, atol=1e-5)
+
+
+def test_katm_contextual_anchor_embedding_end_to_end():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        contextual_anchor_embedding=True,
+        contextual_max_occurrences=5,
+    )
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) > 0
+
+
 # ── keybert_candidate_pos_filter / content_pos_filter ────────────────────
 
 
