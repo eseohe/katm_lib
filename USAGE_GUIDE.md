@@ -225,6 +225,7 @@ model = KATM(
     global_ranking_mode="top_k_average",  # "top_k_average" or "membership"
     global_membership_n_per_doc=10,  # Per-doc top-N window, global_ranking_mode="membership" only
     long_document_strategy="truncate",  # "truncate" or "chunk"
+    compute_doc_topic_probs=False,   # Populate doc_topic_probs_ during fit() (costly; see 8.2)
 )
 ```
 
@@ -287,6 +288,35 @@ document's own chunks instead — a no-op for documents that already fit, so
 it's a strict fix rather than a behavior change for short-document corpora.
 
 ---
+
+### 5.4 Choosing `n_topics` with `select_n_topics`
+
+KATM has no automatic `n_topics="auto"` mode — you must pass an explicit
+`n_topics`. `select_n_topics` is a standalone diagnostic to help you pick
+that number: it scores a range of candidate topic counts on your own
+keyphrase embeddings and returns the best one plus the full score curve,
+without touching KATM at all.
+
+```python
+from katm import KeyphraseExtractor, SentenceEmbedder, select_n_topics
+
+embedder = SentenceEmbedder()
+extractor = KeyphraseExtractor(algorithm="keybert", n_keyphrases=10,
+                                pretrained_model=embedder._model)
+doc_keyphrases = extractor.extract(documents)
+anchors = sorted({kp for kps in doc_keyphrases for kp in kps})
+anchor_embeddings = embedder.encode(anchors)
+
+best_k, scores = select_n_topics(anchor_embeddings, k_min=2, k_max=20, method="bic")
+print(f"Suggested n_topics: {best_k}")
+
+model = KATM(n_topics=best_k, ...)
+model.fit(documents)
+```
+
+`method` is `"bic"` (default), `"aic"`, `"elbow"`, or `"silhouette"` — see
+the function's docstring for the trade-offs. `scores` keeps every k's raw
+BIC/AIC (and silhouette, if requested) for plotting or manual inspection.
 
 ## 6. Compare Keyphrase Extractors
 
@@ -361,15 +391,23 @@ for topic_id in sorted(model.topics_.keys()):
 ```python
 import numpy as np
 
-# For training documents
+# For training documents — requires compute_doc_topic_probs=True at
+# construction time (default False; see 5.1). With the default, this is [].
 doc_topics = model.doc_topic_probs_  # list of np arrays
 
-# For new documents
+# For new documents — always works, regardless of compute_doc_topic_probs.
 doc_topics_new = model.transform(new_documents)  # np array shape (n_new, n_topics)
 
 # Find dominant topic per document
 dominant_topics = np.argmax(doc_topics_new, axis=1)
 ```
+
+`compute_doc_topic_probs=False` (the default) skips re-encoding every
+training document to compute `doc_topic_probs_` — measured at ~35% of total
+`fit()` time on a real 250-document corpus. Topic word lists (`topics_`) are
+completely unaffected either way. Set `compute_doc_topic_probs=True` if you
+need per-training-document topic assignments (e.g. OCTIS-style evaluation,
+or pulling exemplar documents per topic).
 
 ### 8.3 Find documents for a topic
 

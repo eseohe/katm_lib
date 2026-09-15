@@ -5,7 +5,7 @@ from .topic_model_fast import KATMFast
 from .document_builder import DocumentBuilder
 from .keyphrase_extractor import KeyphraseExtractor
 from .embedding import SentenceEmbedder
-from .clustering import GMMTopicClusterer
+from .clustering import GMMTopicClusterer, select_n_topics
 from .topic_assignment import WordTopicProjector
 from .topic_assignment_fast import WordTopicProjectorFast
 from .utils import clean_text, build_vocabulary, extract_content_words
@@ -39,6 +39,7 @@ __all__ = [
     "KeyphraseExtractor",
     "SentenceEmbedder",
     "GMMTopicClusterer",
+    "select_n_topics",
     "WordTopicProjector",
     "WordTopicProjectorFast",
     "clean_text",

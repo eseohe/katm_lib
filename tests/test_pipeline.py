@@ -12,6 +12,7 @@ from katm import (
     KeyphraseExtractor,
     SentenceEmbedder,
     GMMTopicClusterer,
+    select_n_topics,
 )
 from katm.global_keyphrases import extract_global_keyphrases
 from katm.keyphrase_extractor import _chunk_text_for_embedding
@@ -196,6 +197,57 @@ def test_gmm_topic_clusterer_diag_covariance():
     assert clusterer.is_fitted
     assert clusterer.covariance_type == "diag"
     assert clusterer.cluster_centers_.shape == (N_TOPICS, embeddings.shape[1])
+
+
+# ── select_n_topics (manual n_topics diagnostic) ─────────────────────────
+
+
+def test_select_n_topics_bic_default():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    best_k, scores = select_n_topics(embeddings, k_min=2, k_max=4)
+
+    assert isinstance(best_k, int)
+    assert 2 <= best_k <= 4
+    assert scores["k"] == [2, 3, 4]
+    assert len(scores["bic"]) == 3
+    assert len(scores["aic"]) == 3
+    assert "silhouette" not in scores
+
+
+def test_select_n_topics_silhouette_method():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    best_k, scores = select_n_topics(embeddings, k_min=2, k_max=4, method="silhouette")
+
+    assert 2 <= best_k <= 4
+    assert "silhouette" in scores
+    assert len(scores["silhouette"]) == 3
+
+
+def test_select_n_topics_caps_k_max_to_n_samples_minus_one():
+    # GaussianMixture requires n_components <= n_samples; a tiny embedding
+    # array must cap k_max down instead of raising.
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS[:3])
+
+    best_k, scores = select_n_topics(embeddings, k_min=2, k_max=20)
+
+    assert max(scores["k"]) <= len(embeddings) - 1
+    assert best_k <= len(embeddings) - 1
+
+
+def test_select_n_topics_unknown_method_raises():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    try:
+        select_n_topics(embeddings, k_min=2, k_max=3, method="not-a-method")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
 
 
 # ── keyphrase_scope="global" ─────────────────────────────────────────────
