@@ -14,6 +14,7 @@ from katm import (
     GMMTopicClusterer,
     select_n_topics,
 )
+from katm.topic_assignment import WordTopicProjector
 from katm.global_keyphrases import extract_global_keyphrases
 from katm.keyphrase_extractor import _chunk_text_for_embedding
 from katm.utils import _stopwords_for
@@ -337,6 +338,103 @@ def test_extract_global_keyphrases_unknown_ranking_mode():
         assert False, "expected ValueError for an unknown ranking_mode"
     except ValueError:
         pass
+
+
+# ── centroid_mode ─────────────────────────────────────────────────────────
+
+
+def test_katm_centroid_mode_mean_is_default():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+    )
+    assert model.centroid_mode == "mean"
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) > 0
+    # anchor_embeddings_/anchor_labels_ are always populated, even in
+    # centroid_mode="mean", so switching modes needs no other fit() change.
+    assert model.anchor_embeddings_ is not None
+    assert model.anchor_labels_ is not None
+    assert len(model.anchor_labels_) == len(model.anchor_embeddings_)
+    assert model.anchor_phrases_ is not None
+    assert len(model.anchor_phrases_) == len(model.anchor_embeddings_)
+
+
+def test_katm_centroid_mode_max_and_top_k_and_blend():
+    for mode in ("max", "top_k_anchors", "blend"):
+        model = KATM(
+            n_topics=N_TOPICS,
+            n_keyphrases=N_KEYPHRASES,
+            top_n_words=TOP_N_WORDS,
+            min_df=1,
+            min_anchor_df=1,
+            max_anchor_df_ratio=1.0,
+            anchor_dedup_threshold=None,
+            centroid_mode=mode,
+        )
+        model.fit(CORPUS)
+
+        assert isinstance(model.topics_, dict)
+        assert len(model.topics_) > 0, f"centroid_mode={mode} produced no topics"
+
+
+def test_word_topic_projector_unknown_centroid_mode_raises():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS)
+    clusterer.fit(embeddings)
+    projector = WordTopicProjector(clusterer=clusterer, embedder=embedder)
+
+    anchor_labels = clusterer.predict(embeddings)
+    try:
+        projector.project_vocabulary(
+            ["alpha", "beta"], centroid_mode="not-a-mode",
+            anchor_embeddings=embeddings, anchor_labels=anchor_labels,
+        )
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_word_topic_projector_centroid_mode_requires_anchors():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS)
+    clusterer.fit(embeddings)
+    projector = WordTopicProjector(clusterer=clusterer, embedder=embedder)
+
+    try:
+        projector.project_vocabulary(["alpha", "beta"], centroid_mode="max")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+# ── lemma_dedup ───────────────────────────────────────────────────────────
+
+
+def test_katm_lemma_dedup_no_duplicate_lemmas_within_topic():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        lemma_dedup=True,
+    )
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) > 0
 
 
 # ── exclusive_assignment ─────────────────────────────────────────────────

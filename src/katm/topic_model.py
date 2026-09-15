@@ -46,6 +46,10 @@ class KATM:
         global_membership_n_per_doc: int = 10,
         long_document_strategy: str = "truncate",
         compute_doc_topic_probs: bool = False,
+        lemma_dedup: bool = False,
+        centroid_mode: str = "mean",
+        centroid_blend_alpha: float = 0.5,
+        centroid_top_k: int = 3,
     ):
         """Initialize KATM model.
 
@@ -179,6 +183,31 @@ class KATM:
                 unaffected by this flag either way - it always recomputes
                 fresh from the fitted centroids, independent of
                 doc_topic_probs_.
+            lemma_dedup: If True, additionally excludes any candidate word
+                from a topic's word list whose lemma (spaCy, isolated-token)
+                already matches a previously-selected word's lemma in that
+                same topic — a second, independent guard against near-
+                morphological duplicates beyond mmr_max_sim (which can miss
+                them in a compressed/miscalibrated embedding space). Default
+                False, fully backward-compatible. See
+                WordTopicProjector.project_vocabulary's own docstring.
+            centroid_mode: How each topic's relevance score is computed
+                during vocabulary projection. "mean" (default, unchanged
+                behavior) — cosine similarity to the plain GMM centroid.
+                "max"/"top_k_anchors"/"blend" score against individual
+                anchor embeddings instead, to counter "mean" systematically
+                underrepresenting a scattered subgroup of anchors within one
+                cluster (diagnosed directly on a bipolar per-class corpus —
+                see WordTopicProjector.project_vocabulary's docstring for
+                the full mechanism and measured effect). Requires
+                anchor_embeddings_/anchor_labels_, which fit() always
+                computes internally regardless of this setting.
+            centroid_blend_alpha: Weight on the mean-centroid term when
+                centroid_mode="blend" (0 = pure "max", 1 = pure "mean").
+                Default 0.5. Unused for other modes.
+            centroid_top_k: Number of nearest anchors averaged when
+                centroid_mode="top_k_anchors". Default 3. Unused for other
+                modes.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -209,6 +238,10 @@ class KATM:
         self.global_membership_n_per_doc = global_membership_n_per_doc
         self.long_document_strategy = long_document_strategy
         self.compute_doc_topic_probs = compute_doc_topic_probs
+        self.lemma_dedup = lemma_dedup
+        self.centroid_mode = centroid_mode
+        self.centroid_blend_alpha = centroid_blend_alpha
+        self.centroid_top_k = centroid_top_k
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -216,6 +249,9 @@ class KATM:
         self._n_fitted_docs = 0
         self._embedder: Optional[SentenceEmbedder] = None
         self._clusterer: Optional[GMMTopicClusterer] = None
+        self.anchor_embeddings_: Optional[np.ndarray] = None
+        self.anchor_labels_: Optional[np.ndarray] = None
+        self.anchor_phrases_: Optional[List[str]] = None
 
     def fit(self, documents: List[str]) -> "KATM":
         """Run full KATM pipeline.
@@ -322,6 +358,12 @@ class KATM:
         self._embedder  = embedder
         self._clusterer = clusterer
 
+        # Anchor embeddings/labels, kept for centroid_mode != "mean" (see
+        # WordTopicProjector.project_vocabulary) and general diagnostics.
+        self.anchor_embeddings_ = keyphrase_embeddings
+        self.anchor_labels_ = clusterer.predict(keyphrase_embeddings)
+        self.anchor_phrases_ = all_keyphrases
+
         # Step 6: Extract content words from all documents
         content_words = extract_content_words(documents, min_df=self.min_df,
                                                method=self.content_words_method)
@@ -335,6 +377,13 @@ class KATM:
                 mmr_diversity=self.mmr_diversity,
                 mmr_max_sim=self.mmr_max_sim,
                 normalize_embeddings=self.normalize_embeddings,
+                lemma_dedup=self.lemma_dedup,
+                language=self.language,
+                centroid_mode=self.centroid_mode,
+                anchor_embeddings=self.anchor_embeddings_,
+                anchor_labels=self.anchor_labels_,
+                centroid_blend_alpha=self.centroid_blend_alpha,
+                centroid_top_k=self.centroid_top_k,
                 exclusive_assignment=self.exclusive_assignment,
             )
             # Limit to top_n_words per topic

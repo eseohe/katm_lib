@@ -56,6 +56,35 @@ def _stopwords_for(language: str) -> set:
         return set(_stopwords)
 
 
+_SPACY_MODEL = {"english": "en_core_web_sm", "german": "de_core_news_sm", "french": "fr_core_news_sm"}
+
+
+def lemma_key_map(words: List[str], language: str = "english") -> dict:
+    """Map each word to a within-topic dedup key, batch-lemmatized via spaCy
+    with no sentence context (only isolated words are available at this
+    stage - content_words is already a flat, deduplicated vocabulary, not
+    tied back to the sentences it came from).
+
+    This is deliberately a *dedup key*, not a replacement for the returned
+    topic word: callers keep displaying `words` as-is and only use this map
+    to decide whether two candidates are "the same word" for the purposes of
+    excluding both from one topic's word list. Used by
+    topic_assignment.WordTopicProjector.project_vocabulary's lemma_dedup.
+
+    Empirically, isolated-token spaCy lemmatization recovers most
+    inflectional variants correctly even without sentence context, though
+    not all - strong-verb ablaut pairs can still land on different keys.
+    It's a real improvement over no dedup, not a perfect lemmatizer.
+    """
+    import spacy
+    model_name = _SPACY_MODEL.get(language, language)
+    nlp = spacy.load(model_name, disable=["parser", "ner", "senter"])
+    keys = {}
+    for w, doc in zip(words, nlp.pipe(words, batch_size=256)):
+        keys[w] = doc[0].lemma_.lower() if len(doc) else w.lower()
+    return keys
+
+
 def clean_text(text: str) -> str:
     """Strip extra whitespace, normalize unicode, basic cleaning.
 

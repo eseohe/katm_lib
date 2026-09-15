@@ -204,6 +204,20 @@ class GMMTopicClusterer:
         self._is_fitted = True
         return self
 
+    def predict(self, embeddings: np.ndarray) -> np.ndarray:
+        """Predict the hard cluster assignment for each embedding.
+
+        Args:
+            embeddings: numpy.ndarray of shape (N, D).
+
+        Returns:
+            numpy.ndarray of shape (N,) with each embedding's component index.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Model must be fitted before calling predict")
+
+        return self._gmm.predict(embeddings)
+
     def predict_proba(self, embeddings: np.ndarray) -> np.ndarray:
         """Predict posterior probabilities for each component.
 

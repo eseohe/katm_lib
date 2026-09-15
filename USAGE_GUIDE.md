@@ -226,6 +226,10 @@ model = KATM(
     global_membership_n_per_doc=10,  # Per-doc top-N window, global_ranking_mode="membership" only
     long_document_strategy="truncate",  # "truncate" or "chunk"
     compute_doc_topic_probs=False,   # Populate doc_topic_probs_ during fit() (costly; see 8.2)
+    lemma_dedup=False,               # Exclude same-lemma words within one topic's word list
+    centroid_mode="mean",            # "mean" | "max" | "top_k_anchors" | "blend"
+    centroid_blend_alpha=0.5,        # centroid_mode="blend" only
+    centroid_top_k=3,                # centroid_mode="top_k_anchors" only
 )
 ```
 
@@ -241,6 +245,8 @@ model = KATM(
 | `content_words_method` | Need speed → `"tfidf"` (default). Need linguistic precision → `"spacy"` (requires `en_core_web_sm`). |
 | `anchor_dedup_threshold` | Set to `None` to disable dedup. Reduce to 0.80 for stricter dedup. Increase to 0.90 for looser dedup. |
 | `normalize_embeddings` | Enable when documents and keyphrases have very different lengths (improves GMM robustness). |
+| `centroid_mode` | A topic mixes a tight, repetitive anchor subgroup with a scattered one and the word list underrepresents the scattered subgroup → try `"max"`, `"top_k_anchors"`, or `"blend"` instead of `"mean"`. |
+| `lemma_dedup` | A topic's word list shows near-duplicate inflections of the same word (e.g. "running"/"run") that `mmr_max_sim` didn't catch. |
 
 ### 5.3 Global keyphrase extraction (`keyphrase_scope="global"`)
 
