@@ -604,6 +604,51 @@ def test_stopwords_for_unsupported_language_falls_back_to_english():
     assert _stopwords_for("not-a-real-language") == _stopwords_for("english")
 
 
+def test_stopwords_for_german_is_augmented_beyond_nltk():
+    import nltk as _nltk
+    nltk_only = set(_nltk.corpus.stopwords.words("german"))
+    augmented = _stopwords_for("german")
+
+    assert isinstance(augmented, set)
+    assert augmented > nltk_only  # strictly larger - spaCy merge + _EXTRA_STOP_DE
+    assert "the" in augmented  # from _EXTRA_STOP_DE
+
+
+def test_stopwords_for_french_is_augmented_beyond_nltk():
+    import nltk as _nltk
+    nltk_only = set(_nltk.corpus.stopwords.words("french"))
+    augmented = _stopwords_for("french")
+
+    assert isinstance(augmented, set)
+    assert augmented > nltk_only  # strictly larger - spaCy merge
+
+
+def test_strip_email_addresses():
+    from katm import strip_email_addresses
+
+    text = "Contact Ryan, Sean at fsspr@acad3.alaska.edu for details."
+    result = strip_email_addresses(text)
+
+    assert "fsspr@acad3.alaska.edu" not in result
+    assert "fsspr" not in result
+    assert "Contact Ryan, Sean at" in result
+
+
+def test_extract_content_words_tfidf_german_keeps_umlauts():
+    from katm.utils import _extract_content_words_tfidf
+
+    docs = [
+        "Die Universität veröffentlichte eine ausführliche Studie über Bücher und Kultur.",
+        "Studenten lasen viele Bücher an der Universität während des Semesters.",
+    ]
+    words = _extract_content_words_tfidf(docs, min_df=1, language="german")
+
+    assert isinstance(words, list)
+    # German umlauts must survive the unicode-aware token pattern - the old
+    # [a-zA-Z] pattern would have mangled "universität"/"bücher" mid-word.
+    assert any("ü" in w for w in words)
+
+
 # ── keybert_candidate_pos_filter / content_pos_filter ────────────────────
 
 

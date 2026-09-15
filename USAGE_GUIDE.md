@@ -583,10 +583,15 @@ docs = builder.build(raw_texts)
 ### 10.6 Utilities
 
 ```python
-from katm import clean_text, build_vocabulary, extract_content_words
+from katm import clean_text, build_vocabulary, extract_content_words, strip_email_addresses
 
 # Clean messy text
 cleaned = clean_text("Some   messy\t\ntext with   extra spaces!!!")
+
+# Strip emails before tokenization — a personal handle fragment (e.g.
+# "fsspr" from fsspr@acad3.alaska.edu) can't be caught by any fixed
+# stopword list once split apart by a word-token pattern.
+cleaned_docs = [strip_email_addresses(doc) for doc in raw_documents]
 
 # Build vocabulary with frequency filter
 vocab = build_vocabulary(documents, min_df=3)
@@ -594,6 +599,36 @@ vocab = build_vocabulary(documents, min_df=3)
 # Extract content words for custom projection
 content_words = extract_content_words(documents, min_df=3, method="tfidf")
 ```
+
+### 10.7 German and French corpora
+
+`language="german"` or `language="french"` (passed to `KATM`, or to
+`KeyphraseExtractor`/`extract_content_words` directly) select an augmented
+stopword list: NLTK's own per-language list merged with spaCy's (NLTK's
+short lists were found, empirically on real prose corpora, to miss common
+narrative discourse words that spaCy's own list catches), plus, for
+German, a stopgap list of common English/French function words that spaCy's
+`de_core_news_sm` tags PROPN by default (see `utils._EXTRA_STOP_DE`'s
+comment). `content_words_method="tfidf"` and `="spacy"` both use a
+unicode-aware token pattern so umlauts/accents survive tokenization, and
+`language="german"` additionally drops any candidate containing a non-
+German-alphabet character (catches foreign-script leakage a stopword list
+alone can't).
+
+```python
+model = KATM(
+    n_topics=8,
+    language="german",
+    kp_algorithm="rake",              # or "yake"/"tfidf" - "keybert" also honors language
+    content_words_method="spacy",     # required for content_pos_filter, see 5.5
+    content_pos_filter="paper_restricted",  # recommended for literary/narrative prose
+)
+model.fit(german_documents)
+```
+
+`embedding_model` is independent of `language` — pick a sentence-embedding
+model that actually supports the target language separately (e.g. a
+multilingual or German-specific `sentence-transformers` model).
 
 ---
 

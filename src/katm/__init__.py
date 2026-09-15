@@ -8,7 +8,7 @@ from .embedding import SentenceEmbedder
 from .clustering import GMMTopicClusterer, select_n_topics
 from .topic_assignment import WordTopicProjector
 from .topic_assignment_fast import WordTopicProjectorFast
-from .utils import clean_text, build_vocabulary, extract_content_words
+from .utils import clean_text, build_vocabulary, extract_content_words, strip_email_addresses
 
 
 class KATM:
@@ -45,6 +45,7 @@ __all__ = [
     "clean_text",
     "build_vocabulary",
     "extract_content_words",
+    "strip_email_addresses",
 ]
 
 __version__ = "0.2.0"

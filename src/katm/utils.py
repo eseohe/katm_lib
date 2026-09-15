@@ -36,6 +36,26 @@ _EXTRA_STOP = {
 }
 _ALL_STOP = _stopwords | _EXTRA_STOP
 
+# German-language corpora: spaCy's de_core_news_sm tags unrecognized tokens
+# PROPN by default (e.g. it tags stray English/French function words that
+# appear in a German corpus as PROPN, which is one of the POS kept by
+# _extract_content_words_spacy's default content-POS set), so a character-
+# alphabet filter alone (_is_german_alphabet below) does NOT catch them -
+# t/h/e are all valid German letters, so a script/character-set filter is
+# structurally the wrong tool for foreign *words* made of in-alphabet
+# letters. This is a stopgap against exactly that leakage, not a complete
+# language-ID solution for stray foreign-language passages elsewhere in a
+# corpus.
+_EXTRA_STOP_DE = {
+    # English function words
+    "the", "and", "of", "is", "was", "are", "were", "to", "in", "on", "at",
+    "for", "with", "as", "by", "from", "or", "but", "not", "be", "this",
+    "that", "it", "he", "she", "they", "you", "we",
+    # French function words (also plausible via the same foreign-passage
+    # mechanism)
+    "le", "la", "les", "de", "et", "un", "une", "des", "est", "que", "qui",
+}
+
 # Standard German alphabet only (a-z + äöüß). Only meaningful for
 # language="german" content extraction — a no-op character-set filter isn't
 # applicable to English, where loanwords (café, naïve) are common enough
@@ -50,22 +70,45 @@ def _is_german_alphabet(word: str) -> bool:
 
 
 def _stopwords_for(language: str) -> set:
-    """Stopword set for the given language, via NLTK's multilingual stopword
-    corpus. ``"english"`` (the default everywhere in KATM) returns the same
-    232-word list already loaded above. Any other NLTK-supported language
-    code (e.g. ``"german"``, ``"french"``) returns that language's plain
-    NLTK list — no extra augmentation beyond what NLTK ships, and falls back
-    to the English list if NLTK doesn't recognize the code. Used by
-    keyphrase extraction (per-document KeyBERT's stop_words and
-    keyphrase_scope="global"'s candidate-vocabulary filter); content-word
-    extraction (extract_content_words below) is English-only for now.
+    """Stopword set for the given language. ``"english"`` (the default
+    everywhere in KATM) returns the same 232-word NLTK list already loaded
+    above. Any other NLTK-supported language code falls back to the English
+    list if NLTK doesn't recognize it. Used by keyphrase extraction (per-
+    document KeyBERT's stop_words and keyphrase_scope="global"'s candidate-
+    vocabulary filter) and by content-word extraction.
+
+    ``"german"`` and ``"french"`` get extra augmentation beyond NLTK's own
+    (short) lists: NLTK's German list (232 words) and French list (157
+    words) were found, empirically on real prose corpora, to miss nearly
+    every common narrative discourse word (German: schon, immer, sagte,
+    konnte, wohl, kam, ...; French: notamment, egalement, voici, tel, ...)
+    that spaCy's own per-language stopword list already catches (543 words
+    for German, 507 for French) - merged in here rather than relied on
+    alone. ``"german"`` additionally merges _EXTRA_STOP_DE (see its own
+    comment above) against a specific foreign-token-leakage failure mode.
     """
     if language == "english":
-        return set(_stopwords)
-    try:
-        return set(nltk.corpus.stopwords.words(language))
-    except OSError:
-        return set(_stopwords)
+        stop = set(_stopwords)
+    else:
+        try:
+            stop = set(nltk.corpus.stopwords.words(language))
+        except OSError:
+            return set(_stopwords)
+
+    if language == "german":
+        try:
+            import spacy
+            stop |= spacy.load("de_core_news_sm").Defaults.stop_words
+        except OSError:
+            pass
+        stop |= _EXTRA_STOP_DE
+    if language == "french":
+        try:
+            import spacy
+            stop |= spacy.load("fr_core_news_sm").Defaults.stop_words
+        except OSError:
+            pass
+    return stop
 
 
 _SPACY_MODEL = {"english": "en_core_web_sm", "german": "de_core_news_sm", "french": "fr_core_news_sm"}
@@ -231,6 +274,33 @@ def _passes_paper_restricted_filter(token, language: str) -> bool:
     return False
 
 
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")
+
+
+def strip_email_addresses(text: str) -> str:
+    """Remove email addresses from raw text before they reach any
+    vectorizer/keyphrase extractor.
+
+    A whole un-stripped email address gets split by a typical word-token
+    pattern into fragments on non-letter characters
+    ("fsspr@acad3.alaska.edu" -> "fsspr", "acad", "alaska", "edu") - while
+    generic fragments like "edu"/"com"/"org" are already in _EXTRA_STOP, a
+    personal handle fragment like "fsspr" can't be caught by any fixed
+    stopword list, and can survive a document-frequency filter purely
+    because it's one person's own address reused across their own posts,
+    then get projected into an otherwise-unrelated topic as an opaque,
+    meaningless word. Stripping the whole address BEFORE tokenization
+    (rather than blacklisting fragments after the fact) removes the
+    candidate at its source.
+
+    Matches the whole address (local-part@domain, requiring at least one
+    dot in the domain) and removes it entirely rather than replacing it
+    with a placeholder token - an email address carries no topical content
+    once identified as one.
+    """
+    return _EMAIL_RE.sub(" ", text)
+
+
 def clean_text(text: str) -> str:
     """Strip extra whitespace, normalize unicode, basic cleaning.
 
@@ -312,27 +382,32 @@ def extract_content_words(texts: List[str], min_df: int = 3,
     """
     if method == "spacy":
         return _extract_content_words_spacy(texts, min_df, language, pos_filter, max_df)
-    return _extract_content_words_tfidf(texts, min_df)
+    return _extract_content_words_tfidf(texts, min_df, language)
 
 
-def _extract_content_words_tfidf(texts: List[str], min_df: int) -> List[str]:
+def _extract_content_words_tfidf(texts: List[str], min_df: int, language: str = "english") -> List[str]:
     import re as _re
     from sklearn.feature_extraction.text import CountVectorizer
 
+    stop = _stopwords_for(language) | (_EXTRA_STOP if language == "english" else set())
     _bad_token = _re.compile(r"(.)\1{2,}|.{26,}")
     n = len(texts)
     vec = CountVectorizer(
         ngram_range=(1, 1),
-        stop_words="english",
+        stop_words=list(stop),
         min_df=min(min_df, n),
         max_df=0.98,
-        token_pattern=r"(?u)\b[a-zA-Z]{4,}\b",
+        # Unicode-aware: [^\W\d_] matches any letter (incl. ä/ö/ü/ß etc.),
+        # not just a-z — the old [a-zA-Z] pattern silently mangled non-ASCII
+        # scripts (e.g. German umlauts split mid-word).
+        token_pattern=r"(?u)\b[^\W\d_]{4,}\b",
     )
     vec.fit(texts)
     vocab = vec.get_feature_names_out()
     return sorted(
         w for w in vocab
-        if w.lower() not in _ALL_STOP and not _bad_token.search(w)
+        if w.lower() not in stop and not _bad_token.search(w)
+        and (language != "german" or _is_german_alphabet(w))
     )
 
 
