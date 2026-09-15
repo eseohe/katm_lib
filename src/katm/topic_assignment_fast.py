@@ -31,8 +31,8 @@ class WordTopicProjectorFast:
         self,
         vocab: List[str],
         min_prob: float = 0.15,
-        mmr_diversity: float = 0.2,
-        mmr_max_sim: float = 0.85,
+        mmr_diversity: float = 0.3,
+        mmr_max_sim: float = 0.75,
         normalize_embeddings: bool = False,
     ) -> Dict[int, List[Tuple[str, float]]]:
         """Same interface as WordTopicProjector.project_vocabulary."""

@@ -59,8 +59,8 @@ class KATMFast:
         anchor_dedup_threshold: float = 0.85,
         min_anchor_df: int = 2,
         max_anchor_df_ratio: float = 0.4,
-        mmr_diversity: float = 0.2,
-        mmr_max_sim: float = 0.85,
+        mmr_diversity: float = 0.3,
+        mmr_max_sim: float = 0.75,
     ):
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases

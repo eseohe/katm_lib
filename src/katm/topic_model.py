@@ -32,8 +32,8 @@ class KATM:
         anchor_dedup_threshold: float = 0.85,
         min_anchor_df: int = 2,
         max_anchor_df_ratio: float = 0.4,
-        mmr_diversity: float = 0.2,
-        mmr_max_sim: float = 0.85,
+        mmr_diversity: float = 0.3,
+        mmr_max_sim: float = 0.75,
         exclusive_assignment: bool = False,
         keybert_use_mmr: bool = False,
         keybert_diversity: float = 0.5,
@@ -77,12 +77,18 @@ class KATM:
                 (e.g. "feel like" in 73% of MH posts). Default 0.4.
             mmr_diversity: MMR lambda for word-list construction. Controls the
                 relevance/diversity trade-off: 0.0 = pure relevance (top-k by
-                cosine sim), 1.0 = pure diversity. Default 0.2 (80% relevance).
+                cosine sim), 1.0 = pure diversity. Default 0.3 (70%
+                relevance) - raised from an original 0.2 after an empirical
+                sweep on real corpora found the lower value let too many
+                near-morphological duplicates through.
             mmr_max_sim: Hard dedup cap for word-list MMR. Any candidate with
                 cosine similarity above this threshold to any already-selected
                 word is excluded before scoring. Prevents near-morphological
                 duplicates (e.g. anxious/anxiousness, sim=0.93) regardless of
-                lambda. Default 0.85.
+                lambda. Default 0.75 - lowered from an original 0.85, same
+                sweep as mmr_diversity above (0.85 was too permissive in a
+                compressed embedding space where morphological duplicates
+                don't score as similar as the raw cosine threshold assumes).
             exclusive_assignment: If True, a word can only be listed in the
                 one topic it is most similar to (argmax across all topics'
                 centroids), instead of every topic independently filling its

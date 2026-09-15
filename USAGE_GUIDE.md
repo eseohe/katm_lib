@@ -212,8 +212,8 @@ model = KATM(
     anchor_dedup_threshold=0.85,     # Cosine threshold for semantic anchor dedup
     min_anchor_df=2,                 # Min docs a keyphrase must appear in
     max_anchor_df_ratio=0.4,         # Max fraction of docs a phrase may appear in
-    mmr_diversity=0.2,               # MMR lambda: relevance/diversity trade-off
-    mmr_max_sim=0.85,                # Hard dedup cap for word-list MMR
+    mmr_diversity=0.3,               # MMR lambda: relevance/diversity trade-off
+    mmr_max_sim=0.75,                # Hard dedup cap for word-list MMR
     exclusive_assignment=False,      # Word can only be listed in its single best-matching topic
     keybert_use_mmr=False,           # Diversify KeyBERT's own per-document candidates with MMR
     keybert_diversity=0.5,           # MMR lambda for keybert_use_mmr
@@ -565,7 +565,7 @@ vocab = ["galaxy", "mars", "quantum", "gene", "vaccine", "robot", "neural",...]
 topic_words = projector.project_vocabulary(
     vocab,
     min_prob=0.15,
-    mmr_diversity=0.2,
+    mmr_diversity=0.3,
 )
 # Returns: {0: [("quantum", 0.41), ...], 1: [("mars", 0.42), ...], ...}
 ```

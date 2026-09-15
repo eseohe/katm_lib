@@ -26,8 +26,8 @@ class WordTopicProjector:
         self,
         vocab: List[str],
         min_prob: float = 0.15,
-        mmr_diversity: float = 0.2,
-        mmr_max_sim: float = 0.85,
+        mmr_diversity: float = 0.3,
+        mmr_max_sim: float = 0.75,
         normalize_embeddings: bool = False,
         lemma_dedup: bool = False,
         language: str = "english",
@@ -59,10 +59,19 @@ class WordTopicProjector:
             vocab: List of vocabulary words.
             min_prob: Minimum cosine similarity to the centroid for inclusion.
             mmr_diversity: MMR lambda — fraction penalising inter-word
-                similarity. 0.2 means 80 % relevance / 20 % diversity.
+                similarity. Default 0.3 means 70 % relevance / 30 %
+                diversity (raised from an original 0.2 after an empirical
+                sweep on real corpora found the lower value let too many
+                near-morphological duplicates through — see mmr_max_sim
+                below for the matching change).
             mmr_max_sim: Hard dedup cap. Any candidate with cosine similarity
                 above this threshold to any already-selected word is excluded
-                entirely, regardless of its MMR score. Default 0.85.
+                entirely, regardless of its MMR score. Default 0.75 (lowered
+                from an original 0.85 — same sweep as mmr_diversity above:
+                0.85 was too permissive, letting morphological duplicates
+                (e.g. anxious/anxiousness) through in a compressed embedding
+                space where they don't score as similar as the raw cosine
+                threshold assumes).
             lemma_dedup: If True, also exclude any candidate whose lemma
                 (spaCy, isolated-token — see utils.lemma_key_map) matches an
                 already-selected word's lemma *within that topic*. This is a
