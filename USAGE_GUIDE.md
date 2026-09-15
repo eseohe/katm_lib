@@ -235,6 +235,8 @@ model = KATM(
     exclude_abstract_suffixes=False, # German-only, keyphrase_scope="global" only
     contextual_anchor_embedding=False,  # Embed anchors from real occurrences, not bare strings
     contextual_max_occurrences=20,   # contextual_anchor_embedding=True only
+    discard_hub_clusters=False,      # Overcluster and discard the generic-residue component(s)
+    hub_overcluster_k=5,             # discard_hub_clusters=True only
 )
 ```
 
@@ -255,6 +257,7 @@ model = KATM(
 | `keybert_candidate_pos_filter` | Topics look like grammatical/register clusters (all speech verbs, all reproach words) instead of subject-matter clusters. |
 | `content_pos_filter="paper_restricted"` | Same symptom as above but on literary/narrative prose specifically — restricts to nouns, adjectives, and finite lexical verbs only (Uglanova & Gius 2020). |
 | `contextual_anchor_embedding` | Two semantically unrelated anchors merge into one topic because a short polysemous phrase (e.g. a character's nickname) embeds toward its generic dictionary sense instead of how it's actually used in your corpus. |
+| `discard_hub_clusters` | One topic is a generic catch-all of leftover words ("thing", "way", "good", "course"...) with no clear subject — common on literary/narrative prose. |
 
 ### 5.3 Global keyphrase extraction (`keyphrase_scope="global"`)
 
@@ -395,6 +398,45 @@ for any anchor whose exact surface form isn't found in any document
 more `encode()` pass, so it's opt-in — turn it on when anchor quality
 matters more than fit time, e.g. on literary/narrative prose where names,
 nicknames, and place-name fragments are common.
+
+### 5.7 Discarding generic-residue topics (`discard_hub_clusters`)
+
+With a fixed `n_topics`, GMM can be forced to spend one component on a
+catch-all of leftover, individually-generic anchors ("thing", "way",
+"good", "course", ...) that have nowhere thematic to go — diagnosed
+directly on literary prose, where that component's centroid sat at cosine
+similarity 0.91 to the whole anchor pool's global mean (vs. 0.47-0.84 for
+every genuinely thematic cluster in the same run). A component whose
+centroid is unusually close to "the average of everything" isn't really a
+topic — it's generic residue.
+
+```python
+model = KATM(
+    n_topics=8,
+    discard_hub_clusters=True,
+    hub_overcluster_k=5,  # extra components to absorb the residue into
+)
+model.fit(documents)
+```
+
+With this on, the GMM fits `n_topics + hub_overcluster_k` components
+instead of `n_topics`, then keeps only the `n_topics` whose centroid sits
+furthest from the global mean — the overclustering gives the generic
+residue its own component(s) to fall into without taking one of the real
+topic slots. Anchors originally assigned to a discarded component are
+reassigned to their nearest surviving centroid, not dropped, so you still
+get exactly `n_topics` topics and every anchor still counts toward one.
+Inspect `model._clusterer.hub_scores_` and
+`model._clusterer.discarded_component_indices_` after fitting to see which
+components were discarded and why.
+
+This is opt-in and exploratory: the discovery signal (that a hub component
+is generic residue, not a topic) is validated, but the net effect on
+overall topic quality hasn't been independently confirmed beyond the two
+novels it was diagnosed on. Particularly worth trying on literary/
+narrative prose, where this failure mode was found — combine with 5.4's
+`content_pos_filter="paper_restricted"` if you're seeing both a generic
+catch-all topic and grammatical-register clustering.
 
 ## 6. Compare Keyphrase Extractors
 

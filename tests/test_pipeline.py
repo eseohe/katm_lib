@@ -200,6 +200,86 @@ def test_gmm_topic_clusterer_diag_covariance():
     assert clusterer.cluster_centers_.shape == (N_TOPICS, embeddings.shape[1])
 
 
+# ── discard_hub_clusters ──────────────────────────────────────────────────
+
+
+def test_gmm_topic_clusterer_discard_hub_clusters_basic():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)  # 5 samples
+
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS, discard_hub_clusters=True, hub_overcluster_k=2)
+    clusterer.fit(embeddings)
+
+    assert clusterer.is_fitted
+    # n_topics + hub_overcluster_k = 5, capped to n_samples = 5 - discard
+    # still applies since n_components (5) > n_topics (3).
+    assert clusterer.hub_scores_ is not None
+    assert len(clusterer.hub_scores_) == 5
+    assert len(clusterer.discarded_component_indices_) == 5 - N_TOPICS
+    assert clusterer.cluster_centers_.shape == (N_TOPICS, embeddings.shape[1])
+
+
+def test_gmm_topic_clusterer_discard_hub_clusters_predict_in_range():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS, discard_hub_clusters=True, hub_overcluster_k=2)
+    clusterer.fit(embeddings)
+
+    labels = clusterer.predict(embeddings)
+    assert labels.shape == (len(embeddings),)
+    assert labels.min() >= 0
+    assert labels.max() < N_TOPICS
+
+
+def test_gmm_topic_clusterer_discard_hub_clusters_predict_proba_shape():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS, discard_hub_clusters=True, hub_overcluster_k=2)
+    clusterer.fit(embeddings)
+
+    proba = clusterer.predict_proba(embeddings)
+    assert proba.shape == (len(embeddings), N_TOPICS)
+    # Rows sum to ~1.0 normally, but a point whose posterior mass sits
+    # entirely on discarded components sums to ~0 - an honest "doesn't
+    # clearly belong to any surviving topic" rather than a forced
+    # confident-looking distribution (see predict_proba's docstring).
+    row_sums = proba.sum(axis=1)
+    assert np.all((np.isclose(row_sums, 1.0)) | (np.isclose(row_sums, 0.0)))
+
+
+def test_gmm_topic_clusterer_discard_hub_clusters_false_is_unaffected():
+    embedder = SentenceEmbedder()
+    embeddings = embedder.encode(CORPUS)
+
+    clusterer = GMMTopicClusterer(n_topics=N_TOPICS)
+    clusterer.fit(embeddings)
+
+    assert clusterer.hub_scores_ is None
+    assert clusterer.discarded_component_indices_ is None
+    assert clusterer.cluster_centers_.shape == (N_TOPICS, embeddings.shape[1])
+
+
+def test_katm_discard_hub_clusters_end_to_end():
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        discard_hub_clusters=True,
+        hub_overcluster_k=2,
+    )
+    model.fit(CORPUS)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.topics_) == N_TOPICS
+    assert model.anchor_labels_.max() < N_TOPICS
+
+
 # ── select_n_topics (manual n_topics diagnostic) ─────────────────────────
 
 

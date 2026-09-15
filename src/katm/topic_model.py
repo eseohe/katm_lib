@@ -55,6 +55,8 @@ class KATM:
         exclude_abstract_suffixes: bool = False,
         contextual_anchor_embedding: bool = False,
         contextual_max_occurrences: int = 20,
+        discard_hub_clusters: bool = False,
+        hub_overcluster_k: int = 5,
     ):
         """Initialize KATM model.
 
@@ -267,6 +269,32 @@ class KATM:
                 all documents) are embedded and averaged per anchor when
                 contextual_anchor_embedding=True. Default 20 - keeps the
                 cost bounded for very common anchors. Ignored otherwise.
+            discard_hub_clusters: False (default, unchanged behavior - the
+                GMM fits exactly n_topics components). If True, fits
+                n_topics + hub_overcluster_k components instead, then keeps
+                only the n_topics components whose centroid sits FURTHEST
+                (lowest cosine similarity) from the global mean of the
+                anchor pool, discarding the rest. Fixes a concrete failure
+                mode diagnosed on literary prose: with a fixed n_topics,
+                GMM can be forced to spend one component on a catch-all of
+                leftover, individually-generic anchors ("thing", "way",
+                "good", "course", ...) that have nowhere thematic to go - a
+                component whose centroid sits unusually close to "the
+                average of everything" isn't really a topic, it's the
+                generic residue every fixed-k clustering has nowhere else
+                to put. Anchors originally assigned to a discarded
+                component are reassigned to their nearest surviving
+                centroid, not dropped. See GMMTopicClusterer's own
+                docstring for the full mechanism. Opt-in and exploratory -
+                the discovery signal is validated, net effect on topic
+                quality is not yet, but particularly worth trying on
+                literary/narrative prose, where this was diagnosed.
+            hub_overcluster_k: Only used when discard_hub_clusters=True. How
+                many extra components to overcluster with before discarding
+                back down to n_topics. Default 5 - an initial guess, not
+                independently swept; exposed specifically so it can be
+                tuned per-corpus (see GMMTopicClusterer's docstring for the
+                size/certainty trade-off).
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -306,6 +334,8 @@ class KATM:
         self.exclude_abstract_suffixes = exclude_abstract_suffixes
         self.contextual_anchor_embedding = contextual_anchor_embedding
         self.contextual_max_occurrences = contextual_max_occurrences
+        self.discard_hub_clusters = discard_hub_clusters
+        self.hub_overcluster_k = hub_overcluster_k
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
@@ -435,6 +465,8 @@ class KATM:
             n_topics=self.n_topics,
             soft_threshold=self.soft_threshold,
             covariance_type=self.gmm_covariance_type,
+            discard_hub_clusters=self.discard_hub_clusters,
+            hub_overcluster_k=self.hub_overcluster_k,
         )
         clusterer.fit(keyphrase_embeddings)
         self._embedder  = embedder
