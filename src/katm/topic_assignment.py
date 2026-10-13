@@ -32,8 +32,8 @@ class WordTopicProjector:
         lemma_dedup: bool = False,
         language: str = "english",
         centroid_mode: str = "mean",
-        anchor_embeddings: "np.ndarray | None" = None,
-        anchor_labels: "np.ndarray | None" = None,
+        anchor_embeddings: np.ndarray = None,
+        anchor_labels: np.ndarray = None,
         centroid_blend_alpha: float = 0.5,
         centroid_top_k: int = 3,
         exclusive_assignment: bool = False,
@@ -59,45 +59,42 @@ class WordTopicProjector:
             vocab: List of vocabulary words.
             min_prob: Minimum cosine similarity to the centroid for inclusion.
             mmr_diversity: MMR lambda — fraction penalising inter-word
-                similarity. Default 0.3 means 70 % relevance / 30 %
-                diversity (raised from an original 0.2 after an empirical
-                sweep on real corpora found the lower value let too many
-                near-morphological duplicates through — see mmr_max_sim
-                below for the matching change).
+                similarity. Default 0.3 means 70 % relevance / 30 % diversity
+                (raised from an original 0.2 - see topic_model.py's KATM
+                docstring for the sweep that motivated the change).
             mmr_max_sim: Hard dedup cap. Any candidate with cosine similarity
                 above this threshold to any already-selected word is excluded
                 entirely, regardless of its MMR score. Default 0.75 (lowered
-                from an original 0.85 — same sweep as mmr_diversity above:
-                0.85 was too permissive, letting morphological duplicates
-                (e.g. anxious/anxiousness) through in a compressed embedding
-                space where they don't score as similar as the raw cosine
-                threshold assumes).
+                from an original 0.85 - see topic_model.py's KATM docstring).
             lemma_dedup: If True, also exclude any candidate whose lemma
                 (spaCy, isolated-token — see utils.lemma_key_map) matches an
                 already-selected word's lemma *within that topic*. This is a
                 within-topic guard only: it stops one topic from listing
-                e.g. both "running" and "run", but does not stop the same
+                e.g. both "gebückt" and "bücken", but does not stop the same
                 word from being independently selected into several different
                 topics (a different phenomenon — see mmr_max_sim's docstring
                 caveat above; that's the embedding space treating the word as
                 relevant to multiple centroids, not a morphology problem).
                 Default False, fully backward-compatible.
-            language: "english" (default) or "german"/"french". Only used
-                when lemma_dedup=True, to select spaCy's lemmatizer model.
+            language: "english" (default) or "german". Only used when
+                lemma_dedup=True, to select spaCy's lemmatizer model.
             centroid_mode: How each topic's relevance score is computed for
                 the vocabulary projection. "mean" (default, unchanged
                 behavior) - cosine similarity to the GMM centroid, the plain
                 arithmetic mean of that cluster's anchor embeddings.
 
-                Diagnosed directly on a bipolar per-class corpus: when a
-                cluster mixes a tight, lexically-repetitive subgroup of
-                anchors with a scattered subgroup (many different terms,
-                each in its own neighborhood), the mean is pulled toward
-                whichever subgroup is internally tighter, not whichever is
-                more numerous - a cluster that is genuinely ~35% of one
-                scattered subgroup produced a word list only a fraction as
-                representative of it, because the centroid sat closer to
-                the tighter, non-scattered sub-centroid. "mean" alone
+                Diagnosed directly on the bipolar per-class mental-health
+                corpus: when a cluster mixes a tight, lexically-repetitive
+                subgroup of anchors (generic condition-identity language,
+                e.g. "bipolar disorder"/"bipolar type"/"im bipolar" - all
+                close to each other) with a scattered subgroup (many
+                different medication names, each in its own neighborhood),
+                the mean is pulled toward whichever subgroup is internally
+                tighter, not whichever is more numerous - a cluster that is
+                genuinely 35% medication anchors produced a word list only
+                4/20 medication-related, because the centroid sat 0.96
+                cosine-similar to the non-medication sub-centroid but only
+                0.87 to the medication sub-centroid. "mean" alone
                 systematically underrepresents any scattered subgroup
                 regardless of its share of the cluster.
 
@@ -106,9 +103,10 @@ class WordTopicProjector:
                 anchors in the cluster instead of/alongside the mean:
                   - "max": relevance = max cosine similarity to any single
                     anchor in the cluster. Stops penalising scattered
-                    subgroups entirely but can admit words tied to just one
-                    unusual/outlier anchor rather than the cluster as a
-                    whole (noisier).
+                    subgroups entirely (measured: bipolar medication share
+                    in the top-20 rose from 4/20 to 6/20) but can admit
+                    words tied to just one unusual/outlier anchor rather
+                    than the cluster as a whole (noisier).
                   - "top_k_anchors": relevance = mean of the top-k highest
                     per-anchor similarities (k=centroid_top_k, default 3) -
                     a middle ground between "mean" (diluted by the whole
@@ -120,12 +118,13 @@ class WordTopicProjector:
                     - a direct weighted combination of "mean" and "max".
             anchor_embeddings: (n_anchors, dim) array of the anchor pool's
                 own embeddings - required (and used only) when
-                centroid_mode != "mean". KATM already computes this from
-                the same keyphrase embeddings passed to
-                GMMTopicClusterer.fit.
+                centroid_mode != "mean". KATM already computes this as
+                self.anchor_embeddings_ (Step 4/4d output, the exact
+                embeddings clusterer.fit() saw).
             anchor_labels: (n_anchors,) array of each anchor's hard GMM
                 cluster assignment - required (and used only) when
-                centroid_mode != "mean".
+                centroid_mode != "mean". KATM already computes this as
+                self.anchor_labels_.
             centroid_blend_alpha: Weight on the mean-centroid term when
                 centroid_mode="blend" (0 = pure "max", 1 = pure "mean").
                 Default 0.5. Unused for other modes.
@@ -140,15 +139,18 @@ class WordTopicProjector:
                 cross-topic comparison. Default False (original behavior):
                 each topic is filled independently, so a word above
                 min_prob for several centroids at once can be listed in all
-                of their word lists — on some corpora adjacent topics can
-                then share a large fraction of their displayed words,
-                wasting slots a more distinctive word could have filled.
-                This is a different mechanism from mmr_max_sim/mmr_diversity
-                (which only dedup *within* one topic's own list) and from
-                centroid_mode (which only changes *how* similarity to one
-                topic is scored) — this is the first mechanism in the
-                pipeline that makes topics compete with each other for the
-                same word.
+                of their word lists. Diagnosed directly on bipolar per-class
+                data: with exclusive_assignment=False, adjacent topics
+                shared 4-7 of their 15 displayed words (e.g. "bipolars",
+                "psychiatric", "seroquel" all appearing in two or three
+                topics at once) - wasted slots that a genuinely distinctive
+                word (e.g. a specific medication name) could have filled
+                instead. This is a different phenomenon from mmr_max_sim/
+                mmr_diversity (which only dedup *within* one topic's own
+                list) and from centroid_mode (which only changes *how*
+                similarity to one topic is scored) - this is the first
+                mechanism in the pipeline that makes topics compete with
+                each other for the same word.
 
         Returns:
             Dictionary mapping topic_id to list of (word, similarity) tuples,
@@ -177,7 +179,8 @@ class WordTopicProjector:
 
         if centroid_mode != "mean" and (anchor_embeddings is None or anchor_labels is None):
             raise ValueError(
-                "centroid_mode != 'mean' requires anchor_embeddings and anchor_labels"
+                "centroid_mode != 'mean' requires anchor_embeddings and anchor_labels "
+                "(KATM already computes these as self.anchor_embeddings_/self.anchor_labels_)"
             )
 
         n_topics = self.clusterer.n_topics
@@ -251,8 +254,9 @@ class WordTopicProjector:
             # Seed: sims of all unselected candidates to the first selected word.
             # Guard the degenerate case of exactly one candidate above min_prob
             # (unselected == []) — cosine_similarity rejects a 0-sample array,
-            # and the while loop below already no-ops on an empty `unselected`,
-            # so an empty float array here is the correct thing to reach it with.
+            # and there's nothing to seed against anyway; the while loop below
+            # already no-ops on an empty `unselected`, so an empty float array
+            # here is the correct (and only) thing needed to reach it safely.
             if unselected:
                 max_sim_to_selected = cosine_similarity(
                     word_embeddings[unselected],

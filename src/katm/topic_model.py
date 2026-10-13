@@ -1,9 +1,10 @@
 """Main topic model module for KATM."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.mixture import GaussianMixture
 
 from .clustering import GMMTopicClusterer
 from .embedding import SentenceEmbedder
@@ -20,43 +21,61 @@ class KATM:
         kp_algorithm: str = "keybert",
         n_keyphrases: int = 10,
         embedding_model: str = "all-MiniLM-L6-v2",
-        n_topics: int = 10,
+        n_topics: Union[int, str] = 10,
         soft_threshold: float = 0.15,
         top_n_words: int = 20,
         min_df: int = 3,
         yake_use_position: bool = False,
         tfidf_ngram_range: tuple = (1, 2),
         keybert_ngram_range: tuple = (1, 2),
+        keybert_candidate_pos_filter: bool = False,
+        exclude_abstract_suffixes: bool = False,
         content_words_method: str = "tfidf",
+        content_pos_filter: str = None,
         normalize_embeddings: bool = False,
         anchor_dedup_threshold: float = 0.85,
         min_anchor_df: int = 2,
         max_anchor_df_ratio: float = 0.4,
         mmr_diversity: float = 0.3,
         mmr_max_sim: float = 0.75,
+        lemma_dedup: bool = False,
+        centroid_mode: str = "mean",
+        centroid_blend_alpha: float = 0.5,
+        centroid_top_k: int = 3,
         exclusive_assignment: bool = False,
         keybert_use_mmr: bool = False,
         keybert_diversity: float = 0.5,
         language: str = "english",
+        n_topics_range: Tuple[int, int] = (2, 20),
+        n_topics_method: str = "bic",
+        n_topics_covariance_type: str = "diag",
         gmm_covariance_type: str = "full",
         keyphrase_scope: str = "per_document",
         n_keyphrases_total: int = 500,
         global_top_k_docs: "int | None" = None,
         global_ranking_mode: str = "top_k_average",
         global_membership_n_per_doc: int = 10,
+        dim_reduction: Optional[str] = None,
+        dim_reduction_n_components: Optional[int] = None,
         long_document_strategy: str = "truncate",
-        compute_doc_topic_probs: bool = False,
-        lemma_dedup: bool = False,
-        centroid_mode: str = "mean",
-        centroid_blend_alpha: float = 0.5,
-        centroid_top_k: int = 3,
-        keybert_candidate_pos_filter: bool = False,
-        content_pos_filter: "str | None" = None,
-        exclude_abstract_suffixes: bool = False,
+        gsc_candidate_ranking: str = "tfidf",
+        gsc_candidate_pool=0.9,
+        gsc_chunk_size: int = 200,
+        gsc_ngram_range: tuple = (1, 2),
+        gsc_dedup: bool = True,
+        gsc_method: str = "centroid",
+        gsc_batch_size: int = 256,
         contextual_anchor_embedding: bool = False,
         contextual_max_occurrences: int = 20,
         discard_hub_clusters: bool = False,
         hub_overcluster_k: int = 5,
+        compute_doc_topic_probs: bool = False,
+        clustering_method: str = "gmm",
+        clustering_kwargs: Optional[dict] = None,
+        streaming: bool = False,
+        stream_batch_size: int = 64,
+        stream_candidate_vocab: str = "global",
+        stream_progress_every: int = 0,
     ):
         """Initialize KATM model.
 
@@ -64,7 +83,34 @@ class KATM:
             kp_algorithm: Keyphrase extraction algorithm ("keybert", "rake", or "yake").
             n_keyphrases: Number of keyphrases to extract per document.
             embedding_model: Sentence-transformer model name.
-            n_topics: Number of topics to discover.
+            n_topics: Number of topics to discover, OR the string "auto" to
+                select it automatically from the anchor embeddings during
+                fit() (see n_topics_range/n_topics_method). After fit(),
+                self.n_topics always holds the actual integer used — when
+                "auto" was requested, it is overwritten with the selected
+                value and the full per-k diagnostic curve is kept in
+                self.n_topics_selection_scores_ (dict with "k"/"bic"/"aic"
+                lists) for inspection/plotting.
+            n_topics_range: (k_min, k_max) inclusive range to search when
+                n_topics="auto". Ignored otherwise. Default (2, 20).
+            n_topics_method: "bic" (default), "aic", or "elbow" — see
+                clustering.select_n_topics for the reasoning behind each.
+                Ignored unless n_topics="auto".
+            n_topics_covariance_type: Covariance type for the trial GMMs
+                used only during "auto" k-selection (separate from
+                gmm_covariance_type below, which governs the actual
+                production clustering). Default "diag" — "full" was found
+                empirically to make BIC's complexity penalty explode in
+                high-dimensional embedding spaces (D~768+), causing it to
+                always favor the smallest k in n_topics_range regardless of
+                the data. See clustering.select_n_topics for detail.
+                Ignored unless n_topics="auto".
+            gmm_covariance_type: Covariance type for the production GMM that
+                actually clusters the anchor embeddings into topics (see
+                GMMTopicClusterer). Default "full". With a large embedding
+                dimension (e.g. D=1024) "full" is heavily underdetermined
+                against a typical anchor pool; "diag" is far better
+                conditioned there and worth trying.
             soft_threshold: Probability threshold for word-topic assignments.
             top_n_words: Number of top words to store per topic.
             min_df: Minimum document frequency for vocabulary.
@@ -81,25 +127,123 @@ class KATM:
                 (e.g. "feel like" in 73% of MH posts). Default 0.4.
             mmr_diversity: MMR lambda for word-list construction. Controls the
                 relevance/diversity trade-off: 0.0 = pure relevance (top-k by
-                cosine sim), 1.0 = pure diversity. Default 0.3 (70%
-                relevance) - raised from an original 0.2 after an empirical
-                sweep on real corpora found the lower value let too many
-                near-morphological duplicates through.
+                cosine sim), 1.0 = pure diversity. Default 0.3 (70% relevance)
+                - raised from an original 0.2 after sweeping 0.1/0.2/0.3/0.5/0.8
+                on real per-class mental-health corpora: 0.5+ visibly pulled
+                off-topic words into topics (e.g. "manic"/"abortion" showing up
+                in a depression-only corpus's word lists, picked purely for
+                being dissimilar to already-selected words, not for relevance)
+                while 0.3 stayed as coherent as 0.2 with a small diversity gain.
             mmr_max_sim: Hard dedup cap for word-list MMR. Any candidate with
                 cosine similarity above this threshold to any already-selected
                 word is excluded before scoring. Prevents near-morphological
                 duplicates (e.g. anxious/anxiousness, sim=0.93) regardless of
-                lambda. Default 0.75 - lowered from an original 0.85, same
-                sweep as mmr_diversity above (0.85 was too permissive in a
-                compressed embedding space where morphological duplicates
-                don't score as similar as the raw cosine threshold assumes).
+                lambda. Default 0.75 - lowered from an original 0.85 after
+                finding morphological near-duplicates (depressed/depressive/
+                depressing/depresses/depressant all in one topic's word list)
+                sitting at 0.61-0.82 pairwise cosine similarity, i.e. under the
+                old cap; 0.75 removes most of that cluster while leaving
+                genuinely distinct content words (which sat at 0.33-0.64 in
+                the same test) untouched.
+            lemma_dedup: If True, additionally excludes any candidate word
+                from a topic's word list whose lemma (isolated-token spaCy
+                lemmatization, language-appropriate) matches an
+                already-selected word's lemma *within that same topic* -
+                e.g. stops one topic from listing both "gebückt" and
+                "bücken". Independent of mmr_max_sim: in a compressed
+                embedding space, morphological variants of one word don't
+                necessarily score above mmr_max_sim against each other (nor
+                against unrelated words), so that check alone can miss them.
+                Within-topic only — the same word appearing across several
+                different topics is a different phenomenon this does not
+                address. Default False, fully backward-compatible.
+            centroid_mode: How the word-list projection scores each topic
+                (see WordTopicProjector.project_vocabulary's docstring,
+                topic_assignment.py, for the full mechanism and the bipolar
+                diagnostic that motivated this). "mean" (default, unchanged
+                behavior) - cosine similarity to the plain GMM centroid,
+                which was found to systematically underrepresent any
+                scattered anchor subgroup within a cluster (e.g. varied
+                medication names) relative to a tighter one (e.g. repetitive
+                condition-identity phrasing), regardless of its share of the
+                cluster. "max", "top_k_anchors", or "blend" instead score
+                relevance using the cluster's individual anchor embeddings
+                (self.anchor_embeddings_/self.anchor_labels_, already
+                computed at Step 4/4d) - opt-in only, since it changes
+                output on every corpus, not just ones with this failure mode.
+            centroid_blend_alpha: Only used when centroid_mode="blend" - see
+                WordTopicProjector.project_vocabulary. Default 0.5.
+            centroid_top_k: Only used when centroid_mode="top_k_anchors" -
+                see WordTopicProjector.project_vocabulary. Default 3.
             exclusive_assignment: If True, a word can only be listed in the
                 one topic it is most similar to (argmax across all topics'
-                centroids), instead of every topic independently filling its
-                own list from any word above soft_threshold — on some
-                corpora this stops adjacent topics from sharing a large
-                fraction of their displayed words. Default False, fully
-                backward-compatible. See WordTopicProjector.project_vocabulary.
+                mean centroids), instead of every topic independently
+                filling its own list from any word above soft_threshold -
+                see WordTopicProjector.project_vocabulary's docstring for
+                the bipolar diagnostic that motivated this (adjacent topics
+                sharing 4-7 of 15 displayed words with the default). Default
+                False, fully backward-compatible.
+            tfidf_ngram_range: n-gram range for TF-IDF keyphrase mode.
+                Default (1, 2) extracts unigrams and bigrams.
+            keybert_ngram_range: n-gram range for KeyBERT candidate generation.
+                Default (1, 2). Use (1, 3) if you need longer anchor phrases but
+                expect ~2× longer extraction time.
+            keybert_candidate_pos_filter: If True, restricts KeyBERT's own
+                candidate n-grams (i.e. the phrases that go on to become
+                anchors, not just the final display vocabulary -
+                content_pos_filter above only affects the latter) to
+                right-headed noun phrases (last token NOUN/PROPN), via a
+                custom fixed-vocabulary CountVectorizer built from spaCy POS
+                tags. Diagnosed as the correctly-scoped fix for topics that
+                form as tight but non-thematic clusters of words sharing a
+                grammatical/register class (e.g. "said/asked/murmured", all
+                speech verbs) rather than a shared subject - see
+                keyphrase_extractor.py's _noun_final_candidate_vectorizer.
+            exclude_abstract_suffixes: False (default). Only has any effect
+                when keybert_candidate_pos_filter=True and language="german" -
+                additionally drops candidates headed by a word ending in a
+                productive German abstract-nominalization suffix (-ung/
+                -heit/-keit/-nis/-schaft/-tum: Verwunderung, Dankbarkeit,
+                Einsamkeit...). Experimental - see utils.
+                build_noun_final_vocab's docstring for the full rationale
+                and known false positives (Zeitung, Mannschaft).
+                Default False preserves prior behavior byte-for-byte; ~2-4x
+                slower extraction (one spaCy pass over the corpus).
+            content_words_method: ``"tfidf"`` (default), ``"spacy"``,
+                ``"sampled_pos"``, ``"type_pos"`` or ``"type_pos_templates"``. Controls
+                how the vocabulary for topic word projection is built. TF-IDF is
+                ~300× faster; spaCy is more linguistically precise (POS-filtered,
+                lemmatised) but very slow on corpora > ~5,000 docs. The three
+                fast POS options give spaCy-like filtering without tagging the
+                whole corpus: "sampled_pos" tags a few sampled occurrence windows
+                per word (closest to "spacy"), "type_pos" tags each unique word
+                once out of context (fastest, least accurate), "type_pos_templates"
+                tags each word in 4 neutral English frames. All honour
+                content_pos_filter; see fast_content_words.py.
+            content_pos_filter: ``None`` (default) or ``"paper_restricted"``.
+                Affects content_words_method="spacy", "sampled_pos", "type_pos" and
+                "type_pos_templates" ("tfidf" has no POS tags). None keeps the
+                longstanding broad POS set {NOUN, VERB, ADJ, ADV, PROPN}.
+                "paper_restricted" keeps only NN/ADJA/ADJD/VVFIN (German,
+                exact STTS match) or its hand-mapped English equivalent —
+                nouns, adjectives, and *finite lexical* verbs only, excluding
+                infinitives/gerunds/participles/adverbs/proper nouns/modals/
+                auxiliaries — per Uglanova & Gius 2020 ("The Order of
+                Things", CHR 2020), whose LDA runs on German literary prose
+                found this restriction gave their cleanest topic models. Add
+                this if your topics are forming as tight but non-thematic
+                clusters of words sharing a grammatical/register class
+                (e.g. all speech-act verbs, all reproach words) rather than
+                a shared subject — see utils.py's
+                _passes_paper_restricted_filter for the exact tag mapping.
+                Default None preserves prior behavior byte-for-byte.
+            normalize_embeddings: If True, L2-normalise all embeddings before
+                GMM fitting and downstream assignment. This projects keyphrases,
+                words, and documents onto the unit sphere so the GMM covariance
+                matrices capture directional (angular) variance rather than
+                magnitude variance. Makes ``GMM.predict_proba`` valid for
+                out-of-distribution inputs (documents vs keyphrases). Default
+                False to preserve backward compatibility.
             keybert_use_mmr: If True and kp_algorithm="keybert", diversifies
                 KeyBERT's own top-n_keyphrases candidates per document with MMR
                 instead of plain top-n-by-relevance. Distinct from mmr_diversity/
@@ -109,72 +253,175 @@ class KATM:
                 even built. Default False to preserve backward compatibility.
             keybert_diversity: MMR lambda passed to KeyBERT when
                 keybert_use_mmr=True. Default 0.5 (KeyBERT's own default).
-            language: "english" (default) or any other NLTK-supported language
-                code (e.g. "german"). Selects the stopword list used by
-                keyphrase extraction (both kp_algorithm="keybert" and
-                keyphrase_scope="global") via utils._stopwords_for.
-                content_words_method extraction is English-only regardless —
-                this does not affect the topic word-list vocabulary, only
-                which phrases become GMM anchors. embedding_model is
-                independent of this — pick a model that actually supports the
-                language separately.
-            gmm_covariance_type: Covariance type for the GMM that clusters
-                anchor embeddings into topics — see GMMTopicClusterer's own
-                docstring for the full rationale. Default "full" (unchanged
-                behavior); consider "diag" whenever the anchor pool is large
-                relative to embedding dimensionality, which is typical of
-                keyphrase_scope="global" (anchor pool = n_keyphrases_total,
-                default 500, vs the smaller per-document-dedup pool "full"
-                was validated against).
-            keyphrase_scope: "per_document" (default, unchanged behavior —
-                KeyBERT runs once per document, candidates pooled and doc-
-                frequency-filtered) or "global" (one pass over the whole
-                corpus instead of one extraction call per document — see
-                katm.global_keyphrases for the mechanism). Only used when
-                kp_algorithm="keybert" — other algorithms ignore it and
+            language: ``"english"`` (default) or ``"german"``. Selects the
+                stopword list used by KeyBERT extraction and by
+                content_words_method="tfidf"/"spacy" word-list construction,
+                and (for "spacy") which spaCy pipeline is loaded
+                (en_core_web_sm vs de_core_news_sm). embedding_model is
+                independent of this — pick a model that actually supports
+                the language (e.g. a German or multilingual
+                sentence-transformer) separately.
+            keyphrase_scope: "per_document" (default, unchanged behavior -
+                KeyBERT/RAKE/YAKE runs once per document, candidates pooled
+                and doc-frequency-filtered) or "global" (one pass over the
+                whole corpus instead of one extraction call per document -
+                see keyphrase_anchored_tm.global_keyphrases for the two
+                correctness fixes this needed before it could match
+                per-document quality: cross-document frequency filtering
+                applied to candidates before embedding, and ranking by
+                top-k average similarity to best-matching documents rather
+                than a single corpus-wide reference vector. Full
+                before/after evidence across three benchmark datasets in
+                sdtm/KATM_GLOBAL_REPORT.md). Only used when
+                kp_algorithm="keybert" - other algorithms ignore it and
                 always run per-document. Typically 2.5-3.5x faster than
-                per_document mode; there is no universally-better setting, so
-                compare both on your own corpus before switching.
+                per_document mode and matched or beat its coherence on 2 of
+                3 datasets tested; there is no universally-better setting,
+                so compare both on your own corpus before switching.
             n_keyphrases_total: Total keyphrase budget extracted once from
-                the whole corpus — only used when keyphrase_scope="global".
-                Default 500.
+                the whole corpus - only used when keyphrase_scope="global".
+                Default 500. No single value was best across all three
+                datasets tested (500 for two, 1500 for the third) -
+                candidates already surviving the frequency filter are
+                nearly free to rank, so sweeping this is cheap.
             global_top_k_docs: Only used when keyphrase_scope="global". Size
                 of the per-candidate averaging window in the local-relevance
-                ranking — see global_keyphrases.extract_global_keyphrases's
-                docstring for the full mechanism. None (default) keeps the
-                original auto formula, max(5, min(50, n_docs // 20)).
+                ranking (see global_keyphrases.py's extract_global_keyphrases
+                docstring for the full mechanism). None (default) keeps the
+                original auto formula, max(5, min(50, n_docs // 20)) -
+                unchanged behavior. Diagnosed directly on the bipolar
+                per-class mental-health corpus: a candidate with fewer than
+                this many genuinely similar documents (e.g. "depakote" has
+                ZERO documents above 0.5 cosine similarity there) gets its
+                score diluted by forced inclusion of weak matches just to
+                fill the window, while a near-universal condition-identity
+                bigram never hits that floor and keeps a high, undiluted
+                score - systematically outcompeting rarer-but-relevant
+                candidates (specific medication names) for the fixed
+                n_keyphrases_total slots. Lowering this shrinks how much
+                "real" support a candidate needs, at the cost of noisier
+                estimates from fewer documents - exposed as a parameter so
+                that trade-off can be swept per-corpus instead of living
+                inside one hardcoded formula.
             global_ranking_mode: Only used when keyphrase_scope="global".
                 "top_k_average" (default, unchanged behavior) or
-                "membership" — see global_keyphrases.py's module docstring
-                for the mechanism and trade-off of each.
+                "membership" - see global_keyphrases.py's module docstring
+                (fourth-fix section) for the full mechanism. "membership"
+                ports per-document mode's own doc_freq-style selection onto
+                the shared global candidate vocabulary (does a candidate win
+                a "vote" from enough individual documents' own top-N,
+                instead of averaging similarity across a fixed window of
+                documents) - nearly triples medication-candidate survival on
+                the bipolar per-class corpus (1.9% -> 5.6%) and roughly
+                doubles the best achievable GMM-cluster purity (15% -> 35%).
+                Opt-in only - validated on the per-class mental-health
+                corpora, not yet checked as broadly as the other global-mode
+                fixes.
             global_membership_n_per_doc: Only used when
                 global_ranking_mode="membership". Per-document top-N window
                 size for the membership vote, mirroring per-document mode's
                 own n_keyphrases. Default 10.
+            dim_reduction: None (default, unchanged behavior) or "pca" -
+                applied to anchor embeddings before GMM clustering; every
+                downstream embedding (content-word vocabulary, documents)
+                is passed through the same fitted reducer via a thin
+                wrapper (embedding_reduction.ReducedEmbedder), so
+                WordTopicProjector needs no changes to work in the reduced
+                space. Consistently *hurt* coherence (typically -0.05 to
+                -0.12) on every one of 42 configs tested across three
+                datasets - kept as an option for further experimentation,
+                not because it was found to help. "umap" was tried and
+                removed after producing degenerate topics (coherence
+                0.0000) on every dataset - see
+                embedding_reduction.py's module docstring.
+            dim_reduction_n_components: Target PCA dimensionality. Defaults
+                to min(50, n_anchors-1, embedding_dim) when left None.
             long_document_strategy: "truncate" (default, unchanged behavior)
-                or "chunk" — only affects kp_algorithm="keybert",
-                keyphrase_scope="per_document". See
-                KeyphraseExtractor's docstring for the full mechanism: fixes
-                KeyBERT ranking candidates only against a whole-document
-                embedding that SentenceTransformer.encode() silently
-                truncates at the model's max_seq_length. A no-op for any
-                document that already fits within max_seq_length.
-            tfidf_ngram_range: n-gram range for TF-IDF keyphrase mode.
-                Default (1, 2) extracts unigrams and bigrams.
-            keybert_ngram_range: n-gram range for KeyBERT candidate generation.
-                Default (1, 2). Use (1, 3) if you need longer anchor phrases but
-                expect ~2× longer extraction time.
-            content_words_method: ``"tfidf"`` (default) or ``"spacy"``. Controls
-                how the vocabulary for topic word projection is built. TF-IDF is
-                ~300× faster; spaCy is more linguistically precise (POS-filtered,
-                lemmatised) but very slow on corpora > ~5,000 docs.
-            normalize_embeddings: If True, L2-normalise all embeddings before
-                GMM fitting and downstream assignment. This projects keyphrases,
-                words, and documents onto the unit sphere so the GMM covariance
-                matrices capture directional (angular) variance rather than
-                magnitude variance. Makes ``GMM.predict_proba`` valid for
-                out-of-distribution inputs (documents vs keyphrases). Default
-                False to preserve backward compatibility.
+                or "chunk" - only affects kp_algorithm="keybert",
+                keyphrase_scope="per_document". KeyBERT ranks candidates by
+                similarity to one embedding of the whole document, which
+                SentenceTransformer.encode() silently truncates at the
+                model's max_seq_length (256 tokens for all-MiniLM-L6-v2) -
+                confirmed to affect 100% of a real 300-document sample in
+                this project's own mental-health-Reddit notebooks (median
+                document length 1,686 tokens, 6.6x the limit) once several
+                posts are merged into one document. "chunk" splits any
+                document exceeding max_seq_length into sentence-packed
+                chunks that fit within it and scores each candidate by its
+                maximum similarity across the document's own chunks
+                instead - see keyphrase_extractor.KeyphraseExtractor's
+                docstring for the full mechanism and why "max" rather than
+                the keyphrase_scope="global" fix's top-k-average is the
+                right aggregation here. A no-op (identical output to
+                "truncate") for any document that already fits within
+                max_seq_length, so switching this on is a strict fix, never
+                a regression, when your documents happen to be short.
+            gsc_candidate_ranking, gsc_candidate_pool, gsc_chunk_size,
+                gsc_ngram_range, gsc_dedup, gsc_method, gsc_batch_size: Only affect
+                kp_algorithm="gsc" - passed straight through to
+                KeyphraseExtractor, whose own docstring documents each in
+                full (candidate pre-filtering, chunking, dedup, and the
+                "centroid" vs "orthogonal" selection objective).
+            contextual_anchor_embedding: False (default, unchanged behavior -
+                every anchor keyphrase is embedded as a bare, isolated
+                string, exactly as before). If True, each anchor is instead
+                embedded by finding its actual occurrences across the
+                fitted documents (the sentence each occurrence appears in),
+                embedding every occurrence, and averaging - giving the
+                anchor a CONTEXTUALIZED embedding instead of one derived
+                from the phrase's own default/most-common sense in
+                isolation. Added to address a concrete, observed failure
+                mode: embedding a bare polysemous word/phrase (e.g. "kitty"
+                as a character's nickname, "monkey" as half of the place
+                name "Monkey Island") pulls it toward that word's generic
+                dictionary sense (a young cat; a primate) regardless of how
+                it's actually used in the fitted documents, which can merge
+                two semantically unrelated anchors into the same GMM
+                topic. Falls back to the isolated-phrase embedding for any
+                anchor whose exact surface form isn't found in any
+                document (should be rare). This is O(n_anchors x n_docs)
+                substring search plus one extra encode() pass over every
+                collected occurrence, so it costs more than the default -
+                opt in only where anchor quality matters more than fit
+                time, and validate on a small sample before a full corpus
+                run (see project memory's standing validate-small-first
+                practice).
+            contextual_max_occurrences: Cap on how many occurrences (across
+                all documents) are embedded and averaged per anchor when
+                contextual_anchor_embedding=True. Default 20 - keeps the
+                cost bounded for very common anchors without needing every
+                single occurrence; ignored otherwise.
+            clustering_method: ``"gmm"`` (default, the original
+                GMMTopicClusterer - unchanged behaviour) or one of
+                clustering_alt.METHODS: ``"spherical_kmeans"`` (k-means on
+                L2-normalised anchor embeddings, 10 inits; the most stable option
+                in the katm_flake experiments), ``"gmm_ninit"``, ``"gmm_hub"``,
+                ``"overcluster_merge"``, ``"agglomerative"``. For anything but
+                "gmm", soft_threshold / gmm_covariance_type / discard_hub_clusters
+                are not used (use "gmm_hub" for hub discarding).
+            clustering_kwargs: extra keyword arguments for
+                clustering_alt.AltTopicClusterer (e.g. ``{"n_init": 10,
+                "random_state": 42}``). Ignored for "gmm".
+            discard_hub_clusters: False (default, unchanged behavior). If
+                True, the production GMM (Step 5) fits n_topics +
+                hub_overcluster_k components instead of n_topics, then keeps
+                only the n_topics components furthest (lowest cosine
+                similarity) from the global mean of the anchor pool,
+                discarding the rest - see GMMTopicClusterer's own docstring
+                for the full mechanism and the two-novel empirical finding
+                that motivated it (a component whose centroid sits
+                unusually close to "the average of everything" is reliably
+                a generic-word catch-all, not a real topic). Anchors
+                originally assigned to a discarded component are reassigned
+                to their nearest surviving centroid, not dropped. Opt-in and
+                exploratory - the discovery signal is validated, net effect
+                on topic quality is not yet.
+            hub_overcluster_k: Only used when discard_hub_clusters=True. How
+                many extra components to overcluster with before discarding
+                back down to n_topics. Default 5 - an initial guess, not
+                independently swept; exposed specifically so it can be
+                tuned per-corpus (see GMMTopicClusterer's docstring for the
+                size/certainty trade-off).
             compute_doc_topic_probs: False (default - CHANGES PRIOR BEHAVIOR,
                 unlike every other flag in this class). When False, fit()
                 skips Step 8 (encoding every document again and taking
@@ -184,117 +431,67 @@ class KATM:
                 are completely unaffected either way - Step 8 runs strictly
                 after project_vocabulary (Step 7) has already fully
                 determined every topic's word list, so nothing about the
-                topics themselves depends on this flag. Measured on a real
-                250-document novel at 34.5% of total fit() time - the
-                second-largest cost in the whole pipeline after keyphrase
-                extraction itself, for output (doc_topic_probs_) that plain
-                topic-word evaluation never reads. Set True to restore the
-                original behavior - needed for anything that scores or uses
+                topics themselves depends on this flag. Measured directly on
+                a real 250-document German novel at 34.5% of total fit()
+                time (67.3s of 195.1s) - the second-largest cost in the
+                whole pipeline after keyphrase extraction itself, for output
+                (doc_topic_probs_, and models.py's run_katm's "top_docs"
+                exemplar lookup built from it) that plain topic-word
+                evaluation never reads. Set True to restore the original
+                behavior - needed for anything that scores or uses
                 per-document topic assignments (e.g. OCTIS-style evaluation
                 harnesses, or pulling exemplar documents per topic).
                 transform() (scoring NEW documents after fit()) is
                 unaffected by this flag either way - it always recomputes
                 fresh from the fitted centroids, independent of
                 doc_topic_probs_.
-            lemma_dedup: If True, additionally excludes any candidate word
-                from a topic's word list whose lemma (spaCy, isolated-token)
-                already matches a previously-selected word's lemma in that
-                same topic — a second, independent guard against near-
-                morphological duplicates beyond mmr_max_sim (which can miss
-                them in a compressed/miscalibrated embedding space). Default
-                False, fully backward-compatible. See
-                WordTopicProjector.project_vocabulary's own docstring.
-            centroid_mode: How each topic's relevance score is computed
-                during vocabulary projection. "mean" (default, unchanged
-                behavior) — cosine similarity to the plain GMM centroid.
-                "max"/"top_k_anchors"/"blend" score against individual
-                anchor embeddings instead, to counter "mean" systematically
-                underrepresenting a scattered subgroup of anchors within one
-                cluster (diagnosed directly on a bipolar per-class corpus —
-                see WordTopicProjector.project_vocabulary's docstring for
-                the full mechanism and measured effect). Requires
-                anchor_embeddings_/anchor_labels_, which fit() always
-                computes internally regardless of this setting.
-            centroid_blend_alpha: Weight on the mean-centroid term when
-                centroid_mode="blend" (0 = pure "max", 1 = pure "mean").
-                Default 0.5. Unused for other modes.
-            centroid_top_k: Number of nearest anchors averaged when
-                centroid_mode="top_k_anchors". Default 3. Unused for other
-                modes.
-            keybert_candidate_pos_filter: If True and kp_algorithm="keybert"
-                (any keyphrase_scope), restricts candidate generation to
-                right-headed noun phrases (last token NOUN/PROPN) via
-                utils.build_noun_final_vocab — see KeyphraseExtractor's own
-                docstring for the full rationale (fixes grammatical/
-                register-class clusters like "all speech verbs" forming
-                instead of subject-matter ones). Default False, fully
-                backward-compatible.
-            content_pos_filter: None (default, unchanged behavior — the
-                broad {NOUN, VERB, ADJ, ADV, PROPN} set) or
-                "paper_restricted" (NN/ADJA/ADJD/VVFIN per Uglanova & Gius
-                2020 — nouns, adjectives, and finite lexical verbs only).
-                Only affects content_words_method="spacy"; silently ignored
-                for "tfidf" (no POS tags available). Particularly relevant
-                for literary/narrative prose, where the broader POS set can
-                produce grammatical-register topics (all speech-act verbs,
-                all reproach words) rather than subject-matter ones. See
-                utils.extract_content_words's docstring for the mechanism.
-            exclude_abstract_suffixes: Only used when
-                keyphrase_scope="global" (passed through to
-                global_keyphrases.extract_global_keyphrases's candidate
-                vectorizer). If True, additionally drops any candidate
-                whose head ends in a German abstract-nominalization suffix
-                (see utils._GERMAN_ABSTRACT_SUFFIXES). Experimental; no-op
-                for language != "german" regardless of this flag. Default
-                False.
-            contextual_anchor_embedding: False (default, unchanged behavior
-                - every anchor keyphrase is embedded as a bare, isolated
-                string). If True, each anchor is instead embedded from its
-                actual occurrences across the fitted documents (the
-                containing sentence of each occurrence, averaged), giving
-                it a contextualized embedding instead of one derived from
-                the phrase's own default/most-common sense in isolation.
-                Fixes a concrete failure mode: embedding a bare polysemous
-                word/phrase (e.g. "kitty" as a character's nickname) pulls
-                it toward that word's generic dictionary sense regardless
-                of how it's actually used in the corpus, which can merge
-                two semantically unrelated anchors into the same GMM
-                topic. Falls back to the isolated-phrase embedding for any
-                anchor whose exact surface form isn't found in any
-                document (should be rare). O(n_anchors x n_docs) substring
-                search plus one extra encode() pass - costs more than the
-                default, so opt in only where anchor quality matters more
-                than fit time.
-            contextual_max_occurrences: Cap on how many occurrences (across
-                all documents) are embedded and averaged per anchor when
-                contextual_anchor_embedding=True. Default 20 - keeps the
-                cost bounded for very common anchors. Ignored otherwise.
-            discard_hub_clusters: False (default, unchanged behavior - the
-                GMM fits exactly n_topics components). If True, fits
-                n_topics + hub_overcluster_k components instead, then keeps
-                only the n_topics components whose centroid sits FURTHEST
-                (lowest cosine similarity) from the global mean of the
-                anchor pool, discarding the rest. Fixes a concrete failure
-                mode diagnosed on literary prose: with a fixed n_topics,
-                GMM can be forced to spend one component on a catch-all of
-                leftover, individually-generic anchors ("thing", "way",
-                "good", "course", ...) that have nowhere thematic to go - a
-                component whose centroid sits unusually close to "the
-                average of everything" isn't really a topic, it's the
-                generic residue every fixed-k clustering has nowhere else
-                to put. Anchors originally assigned to a discarded
-                component are reassigned to their nearest surviving
-                centroid, not dropped. See GMMTopicClusterer's own
-                docstring for the full mechanism. Opt-in and exploratory -
-                the discovery signal is validated, net effect on topic
-                quality is not yet, but particularly worth trying on
-                literary/narrative prose, where this was diagnosed.
-            hub_overcluster_k: Only used when discard_hub_clusters=True. How
-                many extra components to overcluster with before discarding
-                back down to n_topics. Default 5 - an initial guess, not
-                independently swept; exposed specifically so it can be
-                tuned per-corpus (see GMMTopicClusterer's docstring for the
-                size/certainty trade-off).
+            streaming: False (default) = everything that touches the corpus runs in
+                memory on a list of documents. True = the corpus is processed as a
+                STREAM, so it never has to fit in memory: ``fit()`` then accepts a
+                list OR a zero-argument callable returning a fresh iterator of texts /
+                (id, text) pairs (it is iterated several times: keyphrases, content
+                words, and, if compute_doc_topic_probs, document vectors). What
+                streams: anchor extraction (per-document algorithms such as
+                KeyBERT -> batches of ``stream_batch_size`` documents through the same
+                KeyphraseExtractor, keeping only a phrase->document-frequency
+                Counter), content words (all four content_words_method values via
+                streaming.extract_content_words_stream) and Step 8. Not supported
+                with streaming=True: keyphrase_scope="global",
+                contextual_anchor_embedding. If False and a
+                callable is passed, it is materialised into a list first.
+            stream_batch_size: documents per KeyphraseExtractor call when streaming.
+            stream_progress_every: print a progress line every N documents during the
+                streaming KeyBERT/POS-vocabulary passes (0 = silent).
+            stream_candidate_vocab: only for kp_algorithm="keybert" with
+                keybert_candidate_pos_filter=True. KeyBERT's noun-final candidate vocabulary
+                is corpus-wide (an n-gram is a candidate for every document if it is a noun
+                phrase anywhere), so "global" (default) first streams one spaCy pass to build it,
+                then extracts batch by batch against it - identical anchors to streaming=False.
+                "batch" skips that pass and builds the vocabulary from each batch only: one pass
+                cheaper, approximate (a document only sees candidates found in its own batch).
+            compute_doc_topic_probs: False (default - CHANGES PRIOR BEHAVIOR,
+                unlike every other flag in this class). When False, fit()
+                skips Step 8 (encoding every document again and taking
+                cosine similarity to each topic centroid) entirely -
+                doc_topic_probs_ is left as an empty list, and fit_transform
+                returns an all-zero array instead. topics_/get_topic_words
+                are completely unaffected either way - Step 8 runs strictly
+                after project_vocabulary (Step 7) has already fully
+                determined every topic's word list, so nothing about the
+                topics themselves depends on this flag. Measured directly on
+                a real 250-document German novel at 34.5% of total fit()
+                time (67.3s of 195.1s) - the second-largest cost in the
+                whole pipeline after keyphrase extraction itself, for output
+                (doc_topic_probs_, and models.py's run_katm's "top_docs"
+                exemplar lookup built from it) that plain topic-word
+                evaluation never reads. Set True to restore the original
+                behavior - needed for anything that scores or uses
+                per-document topic assignments (e.g. OCTIS-style evaluation
+                harnesses, or pulling exemplar documents per topic).
+                transform() (scoring NEW documents after fit()) is
+                unaffected by this flag either way - it always recomputes
+                fresh from the fitted centroids, independent of
+                doc_topic_probs_.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -306,69 +503,116 @@ class KATM:
         self.yake_use_position = yake_use_position
         self.tfidf_ngram_range = tfidf_ngram_range
         self.keybert_ngram_range = keybert_ngram_range
+        self.keybert_candidate_pos_filter = keybert_candidate_pos_filter
+        self.exclude_abstract_suffixes = exclude_abstract_suffixes
         self.content_words_method = content_words_method
+        self.content_pos_filter = content_pos_filter
         self.normalize_embeddings = normalize_embeddings
         self.anchor_dedup_threshold = anchor_dedup_threshold
         self.min_anchor_df = min_anchor_df
         self.max_anchor_df_ratio = max_anchor_df_ratio
         self.mmr_diversity = mmr_diversity
         self.mmr_max_sim = mmr_max_sim
+        self.lemma_dedup = lemma_dedup
+        self.centroid_mode = centroid_mode
+        self.centroid_blend_alpha = centroid_blend_alpha
+        self.centroid_top_k = centroid_top_k
         self.exclusive_assignment = exclusive_assignment
         self.keybert_use_mmr = keybert_use_mmr
         self.keybert_diversity = keybert_diversity
         self.language = language
+        self.n_topics_range = n_topics_range
+        self.n_topics_method = n_topics_method
+        self.n_topics_covariance_type = n_topics_covariance_type
         self.gmm_covariance_type = gmm_covariance_type
         self.keyphrase_scope = keyphrase_scope
         self.n_keyphrases_total = n_keyphrases_total
         self.global_top_k_docs = global_top_k_docs
         self.global_ranking_mode = global_ranking_mode
         self.global_membership_n_per_doc = global_membership_n_per_doc
+        self.dim_reduction = dim_reduction
+        self.dim_reduction_n_components = dim_reduction_n_components
         self.long_document_strategy = long_document_strategy
-        self.compute_doc_topic_probs = compute_doc_topic_probs
-        self.lemma_dedup = lemma_dedup
-        self.centroid_mode = centroid_mode
-        self.centroid_blend_alpha = centroid_blend_alpha
-        self.centroid_top_k = centroid_top_k
-        self.keybert_candidate_pos_filter = keybert_candidate_pos_filter
-        self.content_pos_filter = content_pos_filter
-        self.exclude_abstract_suffixes = exclude_abstract_suffixes
+        self.gsc_candidate_ranking = gsc_candidate_ranking
+        self.gsc_candidate_pool = gsc_candidate_pool
+        self.gsc_chunk_size = gsc_chunk_size
+        self.gsc_ngram_range = gsc_ngram_range
+        self.gsc_dedup = gsc_dedup
+        self.gsc_method = gsc_method
+        self.gsc_batch_size = gsc_batch_size
         self.contextual_anchor_embedding = contextual_anchor_embedding
         self.contextual_max_occurrences = contextual_max_occurrences
         self.discard_hub_clusters = discard_hub_clusters
         self.hub_overcluster_k = hub_overcluster_k
+        self.compute_doc_topic_probs = compute_doc_topic_probs
+        from .clustering_alt import METHODS as _CL_METHODS
+        if clustering_method != "gmm" and clustering_method not in _CL_METHODS:
+            raise ValueError(f"clustering_method must be 'gmm' or one of {_CL_METHODS}")
+        self.clustering_method = clustering_method
+        self.clustering_kwargs = dict(clustering_kwargs or {})
+        self.streaming = streaming
+        self.stream_batch_size = stream_batch_size
+        self.stream_candidate_vocab = stream_candidate_vocab
+        self.stream_progress_every = stream_progress_every
+        self.n_topics_selection_scores_: Optional[Dict[str, list]] = None
 
         # State set by fit()
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
         self.doc_topic_probs_: Optional[List[np.ndarray]] = None
         self._n_fitted_docs = 0
+        self._stream_n_docs_ = 0
+        self.content_words_: Optional[List[str]] = None
         self._embedder: Optional[SentenceEmbedder] = None
         self._clusterer: Optional[GMMTopicClusterer] = None
+        self._reducer = None
+
+        # Clustering-geometry evaluation artifacts (internal, label-free
+        # metrics on the anchor embeddings GMM actually clustered - see
+        # subtopic_discovery/clustering_eval.py). Populated by fit();
+        # anchor_embeddings_/anchor_labels_ are None if fit() found no
+        # anchors to cluster (e.g. empty vocabulary after filtering).
         self.anchor_embeddings_: Optional[np.ndarray] = None
         self.anchor_labels_: Optional[np.ndarray] = None
         self.anchor_phrases_: Optional[List[str]] = None
+        self.gmm_: Optional[GaussianMixture] = None
 
-    def fit(self, documents: List[str]) -> "KATM":
+    def fit(self, documents) -> "KATM":
         """Run full KATM pipeline.
 
         Args:
-            documents: List of document strings. If your raw data is posts,
-                group them into documents before calling fit().
+            documents: List of document strings (or, with streaming=True, a list or a
+                zero-argument callable returning a fresh iterator of texts / (id, text)
+                pairs). If your raw data is posts, group them into documents before
+                calling fit().
 
         Returns:
             self for chaining.
         """
-        if not documents:
-            self.topics_ = {}
-            self.doc_topic_probs_ = []
-            return self
+        factory = None
+        if self.streaming:
+            from .streaming import pairs_factory
+            if self.keyphrase_scope == "global" or self.contextual_anchor_embedding:
+                raise NotImplementedError('streaming=True does not support keyphrase_scope="global" '
+                                          "or contextual_anchor_embedding")
+            factory = pairs_factory(documents)
+            documents = None          # never materialised on this path
+        else:
+            if callable(documents):
+                documents = [t if not isinstance(t, tuple) else t[1] for t in documents()]
+            if not documents:
+                self.topics_ = {}
+                self.doc_topic_probs_ = []
+                return self
 
         # Step 1: Load the shared embedder first so KeyBERT can reuse it
         embedder = SentenceEmbedder(model_name=self.embedding_model)
 
         # Step 2/3: Extract keyphrases and build the doc-frequency-filtered
         # anchor pool. "global" only applies to kp_algorithm="keybert" (see
-        # __init__ docstring) - other algorithms always run per-document.
-        if self.keyphrase_scope == "global" and self.kp_algorithm == "keybert":
+        # __init__ docstring) - RAKE/YAKE/etc. always run per-document.
+        if self.streaming:
+            all_keyphrases = self._stream_anchors(factory, embedder)
+        elif self.keyphrase_scope == "global" and self.kp_algorithm == "keybert":
             from .global_keyphrases import extract_global_keyphrases
             all_keyphrases = extract_global_keyphrases(
                 documents, embedder, self.keybert_ngram_range, self.language,
@@ -377,8 +621,10 @@ class KATM:
                 ranking_mode=self.global_ranking_mode,
                 membership_n_per_doc=self.global_membership_n_per_doc,
                 # Reuses the same flag the "per_document" path uses for its
-                # own candidate-generation POS restriction - one flag, same
-                # meaning, regardless of keyphrase_scope.
+                # own candidate-generation POS restriction (see
+                # global_keyphrases.extract_global_keyphrases's
+                # candidate_pos_filter docstring) - one flag, same meaning,
+                # regardless of keyphrase_scope.
                 candidate_pos_filter=self.keybert_candidate_pos_filter,
                 exclude_abstract_suffixes=self.exclude_abstract_suffixes,
             )
@@ -399,6 +645,13 @@ class KATM:
                 keybert_stop_words=kp_stop_words,
                 language=self.language,
                 long_document_strategy=self.long_document_strategy,
+                gsc_candidate_ranking=self.gsc_candidate_ranking,
+                gsc_candidate_pool=self.gsc_candidate_pool,
+                gsc_chunk_size=self.gsc_chunk_size,
+                gsc_ngram_range=self.gsc_ngram_range,
+                gsc_dedup=self.gsc_dedup,
+                gsc_method=self.gsc_method,
+                gsc_batch_size=self.gsc_batch_size,
             )
             doc_keyphrases = kp_extractor.extract(documents)
 
@@ -460,33 +713,91 @@ class KATM:
                 keyphrase_embeddings, all_keyphrases, self.anchor_dedup_threshold
             )
 
-        # Step 5: Cluster keyphrase embeddings
-        clusterer = GMMTopicClusterer(
-            n_topics=self.n_topics,
-            soft_threshold=self.soft_threshold,
-            covariance_type=self.gmm_covariance_type,
-            discard_hub_clusters=self.discard_hub_clusters,
-            hub_overcluster_k=self.hub_overcluster_k,
-        )
-        clusterer.fit(keyphrase_embeddings)
+        # Step 4c: Automatic cluster-count selection, if requested. Runs on
+        # the same (deduped) anchor embeddings that will be clustered below,
+        # so the choice of k reflects the actual anchor pool GMM sees, not
+        # the raw pre-dedup one.
+        if self.n_topics == "auto":
+            from .clustering import select_n_topics
+            k_min, k_max = self.n_topics_range
+            best_k, scores = select_n_topics(
+                keyphrase_embeddings, k_min=k_min, k_max=k_max,
+                method=self.n_topics_method, random_state=42,
+                covariance_type=self.n_topics_covariance_type,
+            )
+            self.n_topics_selection_scores_ = scores
+            self.n_topics = best_k
+
+        # Step 4d: Optional dimensionality reduction (dim_reduction param).
+        # Fit once on the anchor embeddings; every downstream embedding
+        # (content words, documents) goes through the same fitted reducer
+        # via ReducedEmbedder, never refit. None (default) is a no-op -
+        # cluster_input stays identical to keyphrase_embeddings and
+        # proj_embedder behaves exactly like the plain embedder.
+        cluster_input = keyphrase_embeddings
+        if self.dim_reduction is not None:
+            from .embedding_reduction import fit_reducer
+            self._reducer = fit_reducer(
+                self.dim_reduction, keyphrase_embeddings,
+                self.dim_reduction_n_components, random_state=42,
+            )
+            cluster_input = self._reducer.transform(keyphrase_embeddings)
+
+        # Step 5: Cluster (possibly-reduced) keyphrase embeddings
+        if self.clustering_method == "gmm":
+            clusterer = GMMTopicClusterer(
+                n_topics=self.n_topics,
+                soft_threshold=self.soft_threshold,
+                covariance_type=self.gmm_covariance_type,
+                discard_hub_clusters=self.discard_hub_clusters,
+                hub_overcluster_k=self.hub_overcluster_k,
+            )
+        else:
+            from .clustering_alt import AltTopicClusterer
+            clusterer = AltTopicClusterer(n_topics=self.n_topics, method=self.clustering_method,
+                                          **self.clustering_kwargs)
+        clusterer.fit(cluster_input)
         self._embedder  = embedder
         self._clusterer = clusterer
 
-        # Anchor embeddings/labels, kept for centroid_mode != "mean" (see
-        # WordTopicProjector.project_vocabulary) and general diagnostics.
-        self.anchor_embeddings_ = keyphrase_embeddings
-        self.anchor_labels_ = clusterer.predict(keyphrase_embeddings)
-        self.anchor_phrases_ = all_keyphrases
+        # Clustering-geometry evaluation artifacts (see clustering_eval.py).
+        # cluster_input is exactly what clusterer.fit() above saw, so
+        # silhouette/DB/CH/Dunn/BIC/AIC computed on these describe the real
+        # fit, not the raw pre-dedup (or pre-reduction) pool.
+        self.anchor_embeddings_ = cluster_input
+        # clusterer.predict() (not clusterer._gmm.predict()) so the discard_
+        # hub_clusters remap/reassignment is applied when that option is on;
+        # a plain pass-through to self._gmm.predict() otherwise, byte-
+        # identical to before.
+        self.anchor_labels_ = clusterer.predict(cluster_input)
+        self.anchor_phrases_ = all_keyphrases  # same order as anchor_embeddings_/anchor_labels_
+        self.gmm_ = clusterer._gmm
 
         # Step 6: Extract content words from all documents
-        content_words = extract_content_words(documents, min_df=self.min_df,
-                                               method=self.content_words_method,
-                                               language=self.language,
-                                               pos_filter=self.content_pos_filter)
+        if self.streaming:
+            from .streaming import extract_content_words_stream
+            content_words = extract_content_words_stream(factory, min_df=self.min_df,
+                                                         method=self.content_words_method,
+                                                         language=self.language,
+                                                         pos_filter=self.content_pos_filter)
+        else:
+            content_words = extract_content_words(documents, min_df=self.min_df,
+                                                   method=self.content_words_method,
+                                                   language=self.language,
+                                                   pos_filter=self.content_pos_filter)
+        self.content_words_ = content_words
+
+        # proj_embedder composes embedder.encode() with the fitted reducer's
+        # .transform() (or is a plain passthrough when dim_reduction is
+        # None) behind the same .encode() interface, so WordTopicProjector
+        # and the document-embedding step below need no changes to work in
+        # the reduced space.
+        from .embedding_reduction import ReducedEmbedder
+        proj_embedder = ReducedEmbedder(embedder, self._reducer)
 
         # Step 7: Project vocabulary onto clusters
         if content_words:
-            projector = WordTopicProjector(clusterer=clusterer, embedder=embedder)
+            projector = WordTopicProjector(clusterer=clusterer, embedder=proj_embedder)
             self.topics_ = projector.project_vocabulary(
                 content_words,
                 min_prob=self.soft_threshold,
@@ -523,27 +834,69 @@ class KATM:
         # depends on (project_vocabulary, Step 7 above, already fully
         # determined self.topics_ before this point) - it exists only to
         # populate doc_topic_probs_ / support transform()'s style of lookup
-        # for individual fitted documents. Measured at 34.5% of total fit()
-        # time on a real 250-document novel - by far the second-largest cost
-        # after keyphrase extraction itself, for a value plain topic-word
-        # evaluation never reads. Still a real, used feature elsewhere (e.g.
-        # OCTIS-style evaluation harnesses that score document-topic
-        # assignments) - just not one every caller needs paid for by default.
+        # for individual fitted documents. Measured directly (see project
+        # notes: gemini/subtopic_discovery's KATM time-breakdown
+        # investigation) at 34.5% of total fit() time on a real 250-document
+        # German novel (67.3s of 195.1s) - by far the second-largest cost
+        # after keyphrase extraction itself, for a value nothing in that
+        # investigation's own qualitative analysis ever read (it only ever
+        # consumed topics_/get_topic_words). Still a real, used feature
+        # elsewhere (e.g. OCTIS-style evaluation harnesses that score
+        # document-topic assignments, or models.py's run_katm wrapper, which
+        # uses it to find exemplar documents per topic) - just not one every
+        # caller needs paid for by default now.
         if self.compute_doc_topic_probs:
-            doc_embeddings = self._maybe_normalize(embedder.encode(documents, batch_size=32))
             centroids = clusterer.cluster_centers_
-            # Shape: (n_docs, n_topics)
-            sim_to_centroids = cosine_similarity(doc_embeddings, centroids)
-            # Softmax to convert similarities to a probability distribution
-            exp_sim = np.exp(sim_to_centroids - sim_to_centroids.max(axis=1, keepdims=True))
-            doc_probs = exp_sim / exp_sim.sum(axis=1, keepdims=True)
-            self.doc_topic_probs_ = list(doc_probs)
+
+            def _probs(batch):
+                emb_ = self._maybe_normalize(proj_embedder.encode(batch, batch_size=32))
+                # Shape: (n_docs, n_topics)
+                sim_to_centroids = cosine_similarity(emb_, centroids)
+                # Softmax to convert similarities to a probability distribution
+                exp_sim = np.exp(sim_to_centroids - sim_to_centroids.max(axis=1, keepdims=True))
+                return exp_sim / exp_sim.sum(axis=1, keepdims=True)
+
+            if self.streaming:
+                from .streaming import iter_batches
+                self.doc_topic_probs_ = [r for b in iter_batches(factory, 256) for r in _probs(b)]
+            else:
+                self.doc_topic_probs_ = list(_probs(documents))
         else:
             self.doc_topic_probs_ = []
 
-        self._n_fitted_docs = len(documents)
+        self._n_fitted_docs = self._stream_n_docs_ if self.streaming else len(documents)
 
         return self
+
+    def _stream_anchors(self, factory, embedder):
+        """Step 2/3 for streaming=True: the doc-frequency-filtered anchor phrases, from a stream.
+        Sets self._stream_n_docs_ (documents streamed)."""
+        self._stream_n_docs_ = 0
+        from .streaming import extract_perdoc_keyphrases_streaming
+        from .utils import _stopwords_for as _kp_stopwords_for
+        kp_stop_words = "english" if self.language == "english" else list(_kp_stopwords_for(self.language))
+        extractor = KeyphraseExtractor(
+            algorithm=self.kp_algorithm, n_keyphrases=self.n_keyphrases, pretrained_model=embedder._model,
+            yake_use_position=self.yake_use_position, tfidf_ngram_range=self.tfidf_ngram_range,
+            keybert_ngram_range=self.keybert_ngram_range,
+            keybert_candidate_pos_filter=self.keybert_candidate_pos_filter,
+            keybert_use_mmr=self.keybert_use_mmr, keybert_diversity=self.keybert_diversity,
+            keybert_stop_words=kp_stop_words, language=self.language,
+            long_document_strategy=self.long_document_strategy, gsc_candidate_ranking=self.gsc_candidate_ranking,
+            gsc_candidate_pool=self.gsc_candidate_pool, gsc_chunk_size=self.gsc_chunk_size,
+            gsc_ngram_range=self.gsc_ngram_range, gsc_dedup=self.gsc_dedup, gsc_method=self.gsc_method,
+            gsc_batch_size=self.gsc_batch_size)
+        if (self.kp_algorithm == "keybert" and self.keybert_candidate_pos_filter
+                and self.stream_candidate_vocab == "global" and self.long_document_strategy != "chunk"):
+            from .streaming import build_noun_final_vocab_streaming
+            extractor._fixed_candidate_vocab = build_noun_final_vocab_streaming(
+                factory, self.language, self.keybert_ngram_range, progress_every=self.stream_progress_every)
+        phrases, info = extract_perdoc_keyphrases_streaming(
+            factory, extractor, min_df=self.min_anchor_df, max_df_ratio=self.max_anchor_df_ratio,
+            batch_size=self.stream_batch_size, progress_every=self.stream_progress_every, return_info=True)
+        self._stream_n_docs_ = info["n_docs"]
+        self.keyphrase_stream_info_ = {k: v for k, v in info.items() if k != "doc_freq"}
+        return phrases
 
     def _maybe_normalize(self, x: np.ndarray) -> np.ndarray:
         if not self.normalize_embeddings:
@@ -573,8 +926,10 @@ class KATM:
         if not documents:
             return np.zeros((0, self.n_topics))
 
+        from .embedding_reduction import ReducedEmbedder
+        proj_embedder = ReducedEmbedder(self._embedder, self._reducer)
         doc_embeddings = self._maybe_normalize(
-            self._embedder.encode(documents, batch_size=32)
+            proj_embedder.encode(documents, batch_size=32)
         )
         centroids = self._clusterer.cluster_centers_
         sim = cosine_similarity(doc_embeddings, centroids)
@@ -668,6 +1023,53 @@ class KATM:
         print(f"\n{'='*60}\n")
 
 
+# ── S3: vectorized anchor deduplication ──────────────────────────────────────
+
+_DEDUP_MATRIX_MAX_N = 8000  # n×n float32 at this size ≈ 244 MB
+
+
+def _greedy_dedup(
+    embeddings: np.ndarray,
+    phrases: List[str],
+    threshold: float,
+) -> Tuple[np.ndarray, List[str]]:
+    """Greedy semantic dedup of the anchor pool.
+
+    Processes candidates in doc-frequency order (already sorted by caller);
+    keeps a phrase iff its max cosine similarity to all previously kept phrases
+    is below `threshold`. Logic is identical to the original per-row loop;
+    only the implementation changes:
+
+    - n ≤ _DEDUP_MATRIX_MAX_N: one cosine_similarity call for the full n×n
+      pairwise matrix (single BLAS op), then a greedy pass over boolean-indexed
+      rows — replaces n separate sklearn calls with one.
+    - n > _DEDUP_MATRIX_MAX_N: falls back to the original per-row loop to avoid
+      allocating an oversized matrix.
+    """
+    n = len(embeddings)
+    if n == 0:
+        return embeddings, phrases
+
+    if n > _DEDUP_MATRIX_MAX_N:
+        kept_indices = [0]
+        kept_embs = [embeddings[0]]
+        for i in range(1, n):
+            if float(np.max(cosine_similarity([embeddings[i]], kept_embs)[0])) < threshold:
+                kept_indices.append(i)
+                kept_embs.append(embeddings[i])
+        return np.array(kept_embs), [phrases[i] for i in kept_indices]
+
+    sim_matrix = cosine_similarity(embeddings)
+    kept_mask = np.zeros(n, dtype=bool)
+    kept_mask[0] = True
+    for i in range(1, n):
+        if float(sim_matrix[i, kept_mask].max()) < threshold:
+            kept_mask[i] = True
+
+    idx = np.where(kept_mask)[0]
+    return embeddings[idx], [phrases[i] for i in idx]
+
+
 def _contextual_embed_keyphrases(
     phrases: List[str],
     documents: List[str],
@@ -679,14 +1081,16 @@ def _contextual_embed_keyphrases(
     (the containing sentence of each occurrence, averaged) instead of from
     the bare phrase string in isolation.
 
-    Motivation: embedding a short polysemous phrase with no surrounding
-    context pulls it toward that phrase's most common/default sense - e.g.
-    bare "kitty" embeds near "cat" - regardless of how the phrase is
-    actually used in the fitted corpus (a character's nickname). That
-    default-sense embedding is exactly what can merge two semantically
-    unrelated anchors into the same GMM topic. Embedding real occurrences-
-    in-context instead lets the surrounding sentence disambiguate the sense
-    the same way a human reader would.
+    Motivation, found by direct qualitative inspection (see project memory,
+    the book-summary-comparison investigation): embedding a short polysemous
+    phrase with no surrounding context pulls it toward that phrase's most
+    common/default sense - e.g. bare "kitty" embeds near "cat", bare "monkey"
+    embeds near "animal" - regardless of how the phrase is actually used in
+    the fitted corpus (a character's nickname; half of the place name
+    "Monkey Island"). That default-sense embedding is exactly what can merge
+    two semantically unrelated anchors into the same GMM topic. Embedding
+    real occurrences-in-context instead lets the surrounding sentence
+    disambiguate the sense the same way a human reader would.
 
     Mechanism: for each phrase, find every sentence (across every document)
     containing it as a whole-word match, embed each occurrence sentence
@@ -699,9 +1103,8 @@ def _contextual_embed_keyphrases(
 
     All occurrence sentences across all phrases are batched into ONE
     embedder.encode() call (plus a second, smaller call for any bare-phrase
-    fallbacks), not one call per phrase - the expensive part is the
-    O(n_anchors x n_docs) substring search, done in pure Python, not the
-    embedding pass.
+    fallbacks), not one call per phrase - the expensive part is the O(n_anchors
+    x n_docs) substring search, done in pure Python, not the embedding pass.
 
     Returns:
         (len(phrases), embedding_dim) array, same row order as `phrases` -
@@ -757,50 +1160,3 @@ def _contextual_embed_keyphrases(
             out[pi] = row_emb
 
     return out
-
-
-# ── S3: vectorized anchor deduplication ──────────────────────────────────────
-
-_DEDUP_MATRIX_MAX_N = 8000  # n×n float32 at this size ≈ 244 MB
-
-
-def _greedy_dedup(
-    embeddings: np.ndarray,
-    phrases: List[str],
-    threshold: float,
-) -> Tuple[np.ndarray, List[str]]:
-    """Greedy semantic dedup of the anchor pool.
-
-    Processes candidates in doc-frequency order (already sorted by caller);
-    keeps a phrase iff its max cosine similarity to all previously kept phrases
-    is below `threshold`. Logic is identical to the original per-row loop;
-    only the implementation changes:
-
-    - n ≤ _DEDUP_MATRIX_MAX_N: one cosine_similarity call for the full n×n
-      pairwise matrix (single BLAS op), then a greedy pass over boolean-indexed
-      rows — replaces n separate sklearn calls with one.
-    - n > _DEDUP_MATRIX_MAX_N: falls back to the original per-row loop to avoid
-      allocating an oversized matrix.
-    """
-    n = len(embeddings)
-    if n == 0:
-        return embeddings, phrases
-
-    if n > _DEDUP_MATRIX_MAX_N:
-        kept_indices = [0]
-        kept_embs = [embeddings[0]]
-        for i in range(1, n):
-            if float(np.max(cosine_similarity([embeddings[i]], kept_embs)[0])) < threshold:
-                kept_indices.append(i)
-                kept_embs.append(embeddings[i])
-        return np.array(kept_embs), [phrases[i] for i in kept_indices]
-
-    sim_matrix = cosine_similarity(embeddings)
-    kept_mask = np.zeros(n, dtype=bool)
-    kept_mask[0] = True
-    for i in range(1, n):
-        if float(sim_matrix[i, kept_mask].max()) < threshold:
-            kept_mask[i] = True
-
-    idx = np.where(kept_mask)[0]
-    return embeddings[idx], [phrases[i] for i in idx]

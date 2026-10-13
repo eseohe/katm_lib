@@ -14,16 +14,12 @@ def select_n_topics(
     k_max: int = 20,
     method: str = "bic",
     random_state: int = 42,
-    covariance_type: str = "diag",
+    covariance_type: str = "full",
 ) -> Tuple[int, Dict[str, list]]:
-    """Diagnostic helper for choosing n_topics — not wired into KATM itself.
+    """Automatically choose the number of GMM components (topics).
 
     Fits a GMM at every k in [k_min, k_max] (inclusive) on `embeddings` and
-    picks the best k according to `method`. Call this yourself on the same
-    anchor/keyphrase embeddings you'd pass to GMMTopicClusterer.fit (e.g.
-    KeyphraseExtractor's output, embedded), inspect the returned scores, and
-    pass the k you choose as KATM(n_topics=...). There is no n_topics="auto"
-    mode in KATM — this only helps you pick the number up front:
+    picks the best k according to `method`:
 
     - "bic" (default): minimize Bayesian Information Criterion. This is the
       standard, principled criterion for choosing the number of GMM
@@ -56,6 +52,11 @@ def select_n_topics(
       silhouette_score is O(n^2) in the number of embeddings, materially
       more expensive per k than bic/aic, so it isn't computed unconditionally.
 
+    Fitting one GMM per k in the range is O((k_max - k_min) x GMM-fit-cost);
+    for the anchor-embedding counts KATM works with (hundreds to a few
+    thousand keyphrases after dedup) this is fast enough to run inline
+    during fit() and is not a separate offline step.
+
     covariance_type="diag" (not "full") for these trial fits specifically —
     found necessary empirically. With "full" covariance, a GMM component in
     D=768 (typical sentence-embedding dimensionality) has ~D(D+1)/2 ≈ 295k
@@ -67,14 +68,13 @@ def select_n_topics(
     answer, not the data. "diag" costs only D parameters/component, so the
     penalty scales with k roughly linearly instead of quadratically with
     dimensionality, which is enough for an interior minimum to actually
-    emerge. This only affects this k-selection scan; GMMTopicClusterer's own
-    covariance_type for the final production fit is independent (see its
-    own docstring, default "full").
+    emerge. This only affects the k-selection scan; GMMTopicClusterer's own
+    covariance_type for the final production fit is unchanged ("full").
 
     Args:
         embeddings: numpy.ndarray of shape (N, D) — the anchor/keyphrase
             embeddings that will be clustered (i.e. call this on the same
-            array you'll pass to GMMTopicClusterer.fit).
+            array passed to GMMTopicClusterer.fit).
         k_min: Smallest number of components to try. Default 2.
         k_max: Largest number of components to try (inclusive). Default 20.
             Capped down to N-1 automatically if the corpus is too small to
@@ -170,19 +170,13 @@ class GMMTopicClusterer:
                 not how many topics come out.
             soft_threshold: Not currently used, kept for API compatibility.
             random_state: Random seed for reproducibility.
-            covariance_type: sklearn GaussianMixture covariance type. Default
-                "full" (unchanged behavior). "full" gives each component
-                D(D+1)/2 free covariance parameters — with a typical
-                sentence-embedding dimensionality (D=384-1024) that can be
-                tens to hundreds of thousands of parameters per component,
-                wildly underdetermined against a modest anchor pool (a few
-                hundred to a couple thousand points after dedup). "diag" (D
-                parameters/component) is much better conditioned in that
-                regime and worth trying whenever the anchor pool is large
-                relative to embedding dimensionality — e.g.
-                KATM(keyphrase_scope="global"), whose anchor pool is the
-                n_keyphrases_total budget (default 500) rather than the
-                per-document-dedup pool "full" was validated against.
+            covariance_type: sklearn GaussianMixture covariance type.
+                Default "full". "full" gives each component D(D+1)/2 free
+                covariance parameters, which can be wildly underdetermined
+                against a modest anchor pool when D is large (e.g. D=1024);
+                "diag" (D parameters/component) is far better conditioned in
+                that regime and worth trying (it is what the alternative
+                clustering methods and n_topics="auto" scan use).
             discard_hub_clusters: False (default, unchanged behavior - fits
                 exactly n_topics components). If True, fits
                 n_topics + hub_overcluster_k components instead, then keeps
@@ -190,24 +184,26 @@ class GMMTopicClusterer:
                 cosine similarity) from the global mean of the fitted
                 embeddings, discarding the rest.
 
-                Motivated by a direct empirical finding on real literary
-                prose: with a fixed n_topics, GMM is sometimes forced to
-                spend one component on a catch-all of leftover,
-                individually-generic anchors (thing, way, good, course...)
-                that have nowhere thematic to go - that component's
-                centroid sat at cosine similarity 0.91 to the whole anchor
-                pool's global mean (vs. 0.47-0.84 for every genuinely
-                thematic cluster in the same run), and the pattern
-                replicated on a second novel (highest-hubness cluster =
-                filler both times; lowest-hubness clusters were reliably
-                among the most distinctive topics). A component whose
-                centroid is unusually close to "the average of everything"
-                isn't really a topic - it's the generic residue every
-                fixed-k clustering has nowhere else to put. Overclustering
-                first gives that residue its own component(s) to absorb
-                into WITHOUT taking one of the n_topics real slots, and
-                discarding by global-mean proximity afterward removes it
-                while still delivering exactly n_topics topics.
+                Motivated by a direct empirical finding (see project notes:
+                gemini/subtopic_discovery's "T12 filler topic" investigation
+                on The Thirty-Nine Steps and The Sign of Four): with a fixed
+                n_topics, GMM is sometimes forced to spend one component on
+                a catch-all of leftover, individually-generic anchors
+                (thing, way, good, course...) that have nowhere thematic to
+                go - that component's centroid was measured to sit at
+                cosine similarity 0.91 to the whole anchor pool's global
+                mean (vs. 0.47-0.84 for every genuinely thematic cluster in
+                the same run), and the pattern replicated on a second novel
+                (highest-hubness cluster = filler both times; lowest-hubness
+                clusters were reliably among the most distinctive topics,
+                e.g. a coastal cluster at 0.47). A component whose centroid
+                is unusually close to "the average of everything" isn't
+                really a topic - it's the generic residue every fixed-k
+                clustering has nowhere else to put. Overclustering first
+                gives that residue its own component(s) to absorb into
+                WITHOUT taking one of the n_topics real slots, and discarding
+                by global-mean proximity afterward removes it while still
+                delivering exactly n_topics topics.
 
                 Anchors originally assigned to a discarded component are
                 reassigned to their nearest surviving centroid (by cosine
@@ -217,19 +213,17 @@ class GMMTopicClusterer:
 
                 Not yet validated as a net improvement on real topic
                 quality (only the discovery signal itself was validated,
-                two novels) - opt-in and exploratory, but particularly
-                worth trying on literary/narrative prose, where this
-                failure mode was diagnosed.
+                two novels) - opt-in and exploratory.
             hub_overcluster_k: Only used when discard_hub_clusters=True.
                 How many extra components to fit beyond n_topics before
                 discarding the highest-hubness ones back down to n_topics.
                 Default 5 - a starting guess, not independently validated;
-                exposed specifically so it can be swept per-corpus (a
-                larger k gives the residue more room to spread into
-                multiple components and get discarded cleanly, at the cost
-                of a bigger/slower GMM fit and less certainty about which
-                of the extra components are actually "real" topics being
-                wrongly discarded rather than residue).
+                expose as a parameter specifically so it can be swept
+                per-corpus (a large k gives the residue more room to spread
+                into multiple components and get discarded cleanly, at the
+                cost of a bigger/slower GMM fit and less certainty about
+                which of the extra components are actually "real" topics
+                being wrongly discarded rather than residue).
         """
         self.n_topics = n_topics
         self.soft_threshold = soft_threshold
@@ -279,7 +273,7 @@ class GMMTopicClusterer:
             # (lowest hub score = most distinctive); discard the rest.
             order = np.argsort(hub_scores)  # ascending: most distinctive first
             self._kept_component_indices = np.sort(order[: self.n_topics])
-            self.discarded_component_indices_ = np.sort(order[self.n_topics:])
+            self.discarded_component_indices_ = np.sort(order[self.n_topics :])
             self._kept_means = self._gmm.means_[self._kept_component_indices]
         else:
             self._kept_component_indices = None
@@ -303,7 +297,7 @@ class GMMTopicClusterer:
             embeddings: numpy.ndarray of shape (N, D).
 
         Returns:
-            numpy.ndarray of shape (N,) with each embedding's component index.
+            numpy.ndarray of shape (N,), values in [0, n_topics).
         """
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted before calling predict")

@@ -341,13 +341,55 @@ These two are independent — use either alone or together depending on
 whether the register-clustering problem shows up in the anchors, the
 displayed words, or both.
 
+### 5.8 Clustering method, content-word extraction, and large corpora
+
+All of these default to the previous behaviour; each is opt-in.
+
+**Clustering algorithm (`clustering_method`).** `"gmm"` (default) is the
+original `GMMTopicClusterer`. Alternatives, implemented in
+`katm.AltTopicClusterer`: `"spherical_kmeans"` (k-means on L2-normalised
+anchors, i.e. cosine geometry, 10 inits), `"gmm_ninit"`, `"gmm_hub"`
+(GMM with hub discarding), `"overcluster_merge"` and `"agglomerative"`. Pass
+extra arguments via `clustering_kwargs={"n_init": 10, "random_state": 42}`.
+For anything but `"gmm"`, `soft_threshold`, `gmm_covariance_type` and
+`discard_hub_clusters` are not used and `model.gmm_` is `None`.
+
+```python
+model = KATM(n_topics=10, clustering_method="spherical_kmeans")
+```
+
+**Content-word extraction (`content_words_method`).** Besides `"tfidf"`
+(default) and `"spacy"`, there are three fast POS-filtered methods that avoid
+tagging the whole corpus: `"sampled_pos"` (tags a few sampled occurrence
+windows per word; closest to `"spacy"`), `"type_pos"` (tags each unique word
+once, out of context; fastest, least accurate) and `"type_pos_templates"`
+(tags each word in 4 neutral frames). All honour `content_pos_filter`.
+
+**Other options.**
+
+| Parameter | Effect |
+|---|---|
+| `n_topics="auto"` | Select k during `fit()` (see 5.5) |
+| `dim_reduction="pca"`, `dim_reduction_n_components` | PCA on anchors before clustering. Experimental; lowered coherence on every config tested |
+| `gsc_*` (`gsc_candidate_ranking`, `gsc_candidate_pool`, `gsc_chunk_size`, `gsc_ngram_range`, `gsc_dedup`, `gsc_method`, `gsc_batch_size`) | Tuning for `kp_algorithm="gsc"` (also on `KeyphraseExtractor`) |
+| `streaming=True`, `stream_batch_size`, `stream_candidate_vocab`, `stream_progress_every` | Process the corpus as a stream; `fit()` accepts a list or a zero-argument callable returning an iterator of texts. Not supported with `keyphrase_scope="global"` or `contextual_anchor_embedding` |
+
+Note: `gmm_covariance_type` still defaults to `"full"` in this library.
+`n_topics="auto"` scans use `"diag"` (`n_topics_covariance_type`); try
+`gmm_covariance_type="diag"` too when the embedding dimension is large
+relative to the anchor pool.
+
 ---
 
 ### 5.5 Choosing `n_topics` with `select_n_topics`
 
-KATM has no automatic `n_topics="auto"` mode — you must pass an explicit
-`n_topics`. `select_n_topics` is a standalone diagnostic to help you pick
-that number: it scores a range of candidate topic counts on your own
+KATM can pick the number of topics itself: pass `n_topics="auto"` (with
+`n_topics_range=(2, 20)`, `n_topics_method="bic"|"aic"|"elbow"`, and
+`n_topics_covariance_type="diag"`) and `fit()` selects k from the anchor
+embeddings, overwrites `model.n_topics` with the integer chosen and keeps the
+score curve in `model.n_topics_selection_scores_`. Alternatively,
+`select_n_topics` is a standalone diagnostic to help you pick
+that number up front: it scores a range of candidate topic counts on your own
 keyphrase embeddings and returns the best one plus the full score curve,
 without touching KATM at all.
 
