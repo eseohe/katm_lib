@@ -1,6 +1,7 @@
 import os
 import sys
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -608,6 +609,48 @@ def test_katm_long_document_strategy_chunk_end_to_end():
         max_anchor_df_ratio=1.0,
         anchor_dedup_threshold=None,
         long_document_strategy="chunk",
+        compute_doc_topic_probs=True,
+    )
+    model.fit(corpus)
+
+    assert isinstance(model.topics_, dict)
+    assert len(model.doc_topic_probs_) == len(corpus)
+
+
+def test_keyphrase_extractor_chunk_extract_grows_with_document_length():
+    # chunk_extract keeps n_keyphrases_per_chunk phrases per chunk, so a long
+    # document yields more phrases than a one-chunk document.
+    embedder = SentenceEmbedder()
+    tokenizer = embedder._model.tokenizer
+    n_chunks = len(_chunk_text_for_embedding(LONG_DOCUMENT, tokenizer, embedder._model.max_seq_length))
+    assert n_chunks > 1
+    extractor = KeyphraseExtractor(
+        algorithm="keybert", n_keyphrases=5, pretrained_model=embedder._model,
+        long_document_strategy="chunk_extract", n_keyphrases_per_chunk=3,
+    )
+    long_kps, short_kps = extractor.extract([LONG_DOCUMENT, CORPUS[0]])
+    assert 0 < len(short_kps) <= 3
+    assert len(set(long_kps)) == len(long_kps)   # union across chunks, no duplicates
+    assert len(long_kps) > 0
+
+
+def test_keyphrase_extractor_rejects_unknown_long_document_strategy():
+    with pytest.raises(ValueError):
+        KeyphraseExtractor(algorithm="keybert", long_document_strategy="nope")
+
+
+def test_katm_long_document_strategy_chunk_extract_end_to_end():
+    corpus = CORPUS + [LONG_DOCUMENT]
+    model = KATM(
+        n_topics=N_TOPICS,
+        n_keyphrases=N_KEYPHRASES,
+        top_n_words=TOP_N_WORDS,
+        min_df=1,
+        min_anchor_df=1,
+        max_anchor_df_ratio=1.0,
+        anchor_dedup_threshold=None,
+        long_document_strategy="chunk_extract",
+        n_keyphrases_per_chunk=2,
         compute_doc_topic_probs=True,
     )
     model.fit(corpus)

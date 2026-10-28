@@ -75,6 +75,7 @@ class KATM:
         dim_reduction: Optional[str] = None,
         dim_reduction_n_components: Optional[int] = None,
         long_document_strategy: str = "truncate",
+        n_keyphrases_per_chunk: int = 5,
         gsc_candidate_ranking: str = "tfidf",
         gsc_candidate_pool=0.9,
         gsc_chunk_size: int = 200,
@@ -366,8 +367,13 @@ class KATM:
                 embedding_reduction.py's module docstring.
             dim_reduction_n_components: Target PCA dimensionality. Defaults
                 to min(50, n_anchors-1, embedding_dim) when left None.
-            long_document_strategy: "truncate" (default, unchanged behavior)
-                or "chunk" - only affects kp_algorithm="keybert",
+            n_keyphrases_per_chunk: Only used with long_document_strategy=
+                "chunk_extract": keyphrases extracted from each ~256-token
+                chunk separately (default 5); a document's phrases are the
+                union over its chunks.
+            long_document_strategy: "truncate" (default, unchanged behavior),
+                "chunk", or "chunk_extract" (per-chunk extraction, see
+                n_keyphrases_per_chunk) - only affects kp_algorithm="keybert",
                 keyphrase_scope="per_document". KeyBERT ranks candidates by
                 similarity to one embedding of the whole document, which
                 SentenceTransformer.encode() silently truncates at the
@@ -570,6 +576,7 @@ class KATM:
         self.dim_reduction = dim_reduction
         self.dim_reduction_n_components = dim_reduction_n_components
         self.long_document_strategy = long_document_strategy
+        self.n_keyphrases_per_chunk = n_keyphrases_per_chunk
         self.gsc_candidate_ranking = gsc_candidate_ranking
         self.gsc_candidate_pool = gsc_candidate_pool
         self.gsc_chunk_size = gsc_chunk_size
@@ -766,6 +773,7 @@ class KATM:
                 keybert_stop_words=kp_stop_words,
                 language=self.language,
                 long_document_strategy=self.long_document_strategy,
+                n_keyphrases_per_chunk=self.n_keyphrases_per_chunk,
                 gsc_candidate_ranking=self.gsc_candidate_ranking,
                 gsc_candidate_pool=self.gsc_candidate_pool,
                 gsc_chunk_size=self.gsc_chunk_size,
@@ -1085,12 +1093,13 @@ class KATM:
             keybert_candidate_pos_filter=self.keybert_candidate_pos_filter,
             keybert_use_mmr=self.keybert_use_mmr, keybert_diversity=self.keybert_diversity,
             keybert_stop_words=kp_stop_words, language=self.language,
-            long_document_strategy=self.long_document_strategy, gsc_candidate_ranking=self.gsc_candidate_ranking,
+            long_document_strategy=self.long_document_strategy,
+            n_keyphrases_per_chunk=self.n_keyphrases_per_chunk, gsc_candidate_ranking=self.gsc_candidate_ranking,
             gsc_candidate_pool=self.gsc_candidate_pool, gsc_chunk_size=self.gsc_chunk_size,
             gsc_ngram_range=self.gsc_ngram_range, gsc_dedup=self.gsc_dedup, gsc_method=self.gsc_method,
             gsc_batch_size=self.gsc_batch_size)
         if (self.kp_algorithm == "keybert" and self.keybert_candidate_pos_filter
-                and self.stream_candidate_vocab == "global" and self.long_document_strategy != "chunk"):
+                and self.stream_candidate_vocab == "global" and self.long_document_strategy not in ("chunk", "chunk_extract")):
             from .streaming import build_noun_final_vocab_streaming
             extractor._fixed_candidate_vocab = build_noun_final_vocab_streaming(
                 factory, self.language, self.keybert_ngram_range, progress_every=self.stream_progress_every)

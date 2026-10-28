@@ -224,7 +224,8 @@ model = KATM(
     global_top_k_docs=None,          # Averaging window size, keyphrase_scope="global" only
     global_ranking_mode="top_k_average",  # "top_k_average" or "membership"
     global_membership_n_per_doc=10,  # Per-doc top-N window, global_ranking_mode="membership" only
-    long_document_strategy="truncate",  # "truncate" or "chunk"
+    long_document_strategy="truncate",  # "truncate", "chunk" or "chunk_extract"
+    n_keyphrases_per_chunk=5,        # long_document_strategy="chunk_extract" only
     compute_doc_topic_probs=False,   # Populate doc_topic_probs_ during fit() (costly; see 8.2)
     lemma_dedup=False,               # Exclude same-lemma words within one topic's word list
     centroid_mode="mean",            # "mean" | "max" | "top_k_anchors" | "blend"
@@ -303,6 +304,37 @@ truncates at the model's `max_seq_length` (256 tokens for
 sentence-packed chunks and scores by the maximum similarity across a
 document's own chunks instead — a no-op for documents that already fit, so
 it's a strict fix rather than a behavior change for short-document corpora.
+
+`long_document_strategy="chunk_extract"` (`kp_algorithm="keybert"`,
+`keyphrase_scope="per_document"` only) goes one step further: it splits each
+document into the same chunks but extracts keyphrases from **each chunk
+separately** — candidates are that chunk's own n-grams, ranked against that
+chunk's embedding, top `n_keyphrases_per_chunk` kept (MMR if
+`keybert_use_mmr`) — and takes the union across the document's chunks. A
+document that fits in one chunk therefore gets `n_keyphrases_per_chunk`
+phrases (not `n_keyphrases`), and a long document gets up to
+`n_keyphrases_per_chunk × n_chunks`, so the anchor pool grows with document
+length.
+
+```python
+model = KATM(n_topics=20, kp_algorithm="keybert",
+             long_document_strategy="chunk_extract", n_keyphrases_per_chunk=5)
+```
+
+Testbed result (raw 20 Newsgroups test split, 7,317 documents, 24% longer than
+256 tokens, K=20, GMM, one run each; not re-run in this library):
+
+| `long_document_strategy` | anchors | coherence | NMI | purity |
+|---|---|---|---|---|
+| `"truncate"` | 4,968 | 0.4426 | 0.488 | 0.507 |
+| `"chunk"` | 4,889 | 0.4348 | 0.476 | 0.462 |
+| `"chunk_extract"`, `n_keyphrases_per_chunk=5` | 3,915 | 0.4712 | 0.496 | 0.508 |
+| `"chunk_extract"`, `n_keyphrases_per_chunk=3` | 2,192 | 0.4587 | 0.467 | 0.471 |
+
+`chunk_extract` with 5 per chunk had the best coherence and NMI here, with
+fewer anchors than `"truncate"`. The differences in NMI and purity are small
+for a single run, so compare on your own corpus. With 3 per chunk the anchor
+pool shrinks enough to cost NMI.
 
 ### 5.4 Restricting to grammatical classes (`keybert_candidate_pos_filter`, `content_pos_filter`)
 

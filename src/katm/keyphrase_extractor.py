@@ -318,6 +318,7 @@ class KeyphraseExtractor:
                  keybert_ngram_range: tuple = (1, 2), keybert_use_mmr: bool = False,
                  keybert_diversity: float = 0.5, keybert_stop_words="english",
                  language: str = "english", long_document_strategy: str = "truncate",
+                 n_keyphrases_per_chunk: int = 5,
                  gsc_candidate_ranking: str = "tfidf", gsc_candidate_pool=0.9,
                  gsc_chunk_size: int = 200, gsc_ngram_range: tuple = (1, 2),
                  gsc_dedup: bool = True, gsc_method: str = "centroid",
@@ -357,8 +358,12 @@ class KeyphraseExtractor:
                 a compressed-embedding-space false-similarity match, which
                 raising similarity thresholds alone can't reliably fix since
                 the token shouldn't be a candidate in the first place.
-            long_document_strategy: "truncate" (default, unchanged behavior)
-                or "chunk". Only affects algorithm="keybert". KeyBERT ranks
+            n_keyphrases_per_chunk: Only used with long_document_strategy=
+                "chunk_extract": keyphrases kept from each chunk (default 5).
+            long_document_strategy: "truncate" (default, unchanged behavior),
+                "chunk", or "chunk_extract" (extract from each chunk
+                separately and take the union; see
+                _extract_keybert_per_chunk). Only affects algorithm="keybert". KeyBERT ranks
                 candidate phrases by cosine similarity to a single embedding
                 of the whole document - but SentenceTransformer.encode()
                 silently truncates that embedding at the model's
@@ -471,9 +476,10 @@ class KeyphraseExtractor:
         valid_algorithms = {"keybert", "rake", "yake", "gsc", "tfidf"}
         if algorithm not in valid_algorithms:
             raise ValueError(f"Unknown algorithm '{algorithm}'. Must be one of {valid_algorithms}")
-        if long_document_strategy not in {"truncate", "chunk"}:
+        if long_document_strategy not in {"truncate", "chunk", "chunk_extract"}:
             raise ValueError(
-                f"long_document_strategy must be 'truncate' or 'chunk' - got {long_document_strategy!r}"
+                "long_document_strategy must be 'truncate', 'chunk' or 'chunk_extract' - "
+                f"got {long_document_strategy!r}"
             )
 
         self.algorithm = algorithm
@@ -487,6 +493,7 @@ class KeyphraseExtractor:
         self._keybert_stop_words = keybert_stop_words
         self._language = language
         self._long_document_strategy = long_document_strategy
+        self._n_keyphrases_per_chunk = n_keyphrases_per_chunk
         self._gsc_candidate_ranking = gsc_candidate_ranking
         self._gsc_candidate_pool = gsc_candidate_pool
         self._gsc_chunk_size = gsc_chunk_size
@@ -582,6 +589,8 @@ class KeyphraseExtractor:
 
         if self._long_document_strategy == "chunk":
             phrases = self._extract_keybert_chunked(documents)
+        elif self._long_document_strategy == "chunk_extract":
+            phrases = self._extract_keybert_per_chunk(documents)
         else:
             # Pass the full corpus in one call so KeyBERT encodes all candidates
             # in a single batched model.encode() rather than one call per document.
@@ -676,6 +685,63 @@ class KeyphraseExtractor:
                 keywords = [candidates[i] for i in top_idx]
 
             results.append(keywords)
+
+        return results
+
+    def _extract_keybert_per_chunk(self, documents: List[str]) -> List[List[str]]:
+        """long_document_strategy="chunk_extract": split each document into
+        the same sentence-packed, token-budget chunks as "chunk", but extract
+        keyphrases from EACH chunk separately - candidates are n-grams of that
+        chunk only, ranked by similarity to that chunk's own embedding, top
+        n_keyphrases_per_chunk kept (MMR when keybert_use_mmr) - then take the
+        union across the document's chunks (order preserved, duplicates
+        dropped). A document that fits in one chunk therefore gets
+        n_keyphrases_per_chunk phrases, not n_keyphrases; a long document gets
+        up to n_keyphrases_per_chunk * n_chunks, so the anchor pool grows with
+        document length."""
+        import numpy as np
+        from sklearn.feature_extraction.text import CountVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        st_model = self._keybert_model.model.embedding_model
+        max_tokens = getattr(st_model, "max_seq_length", 256) or 256
+        n_per = self._n_keyphrases_per_chunk
+
+        results: List[List[str]] = []
+        for doc in documents:
+            if not doc.strip():
+                results.append([])
+                continue
+            chunks = _chunk_text_for_embedding(doc, st_model.tokenizer, max_tokens)
+            chunk_embeddings = st_model.encode(chunks, batch_size=32, show_progress_bar=False)
+
+            doc_phrases: List[str] = []
+            seen = set()
+            for chunk, chunk_emb in zip(chunks, chunk_embeddings):
+                try:
+                    cv = CountVectorizer(
+                        ngram_range=self._keybert_ngram_range,
+                        stop_words=self._keybert_stop_words,
+                        min_df=1,
+                    ).fit([chunk])
+                except ValueError:
+                    continue  # no candidates survive in this chunk
+                candidates = list(cv.get_feature_names_out())
+                if not candidates:
+                    continue
+                candidate_embeddings = st_model.encode(candidates, batch_size=64, show_progress_bar=False)
+                relevance = cosine_similarity(candidate_embeddings, chunk_emb.reshape(1, -1))[:, 0]
+                if self._keybert_use_mmr:
+                    keywords = _max_relevance_mmr(
+                        relevance, candidate_embeddings, candidates, n_per, self._keybert_diversity,
+                    )
+                else:
+                    keywords = [candidates[i] for i in np.argsort(relevance)[::-1][:n_per]]
+                for kw in keywords:
+                    if kw not in seen:
+                        seen.add(kw)
+                        doc_phrases.append(kw)
+            results.append(doc_phrases)
 
         return results
 
