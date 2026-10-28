@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="katm",
-    version="0.3.0",
+    version="0.4.0",
     author="Eustace Ebhotemhen",
     description="Keyphrase Anchored Topic Modeling (KATM)",
     packages=find_packages(where="src"),

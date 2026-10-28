@@ -383,15 +383,11 @@ def extract_content_words(texts: List[str], min_df: int = 3,
     Args:
         texts:  List of raw text strings.
         min_df: Minimum document frequency threshold.
-        method: ``"tfidf"`` (default), ``"spacy"``, or one of the fast POS
-                alternatives to ``"spacy"`` (see fast_content_words.py; all honour
-                ``pos_filter``):
-                ``"sampled_pos"`` - POS-tags only a few sampled occurrence windows
-                per word (3 windows of +-5 tokens) instead of every token, plus a
-                capitalisation name filter for English/French;
-                ``"type_pos"`` - tags every unique word once, without context;
-                ``"type_pos_templates"`` - tags every unique word in 4 neutral
-                English frames, kept if it passes in any (English only).
+        method: ``"tfidf"`` (default), ``"spacy"`` or ``"sampled_pos"`` (
+                only: POS-tags a few sampled occurrence windows per word instead of the
+                whole corpus, ~14x faster than "spacy" on ELTeC-100 with ~97% precision /
+                89% recall against its vocabulary; honours pos_filter - see
+                fast_content_words.py).
 
                 ``"tfidf"`` — fits a CountVectorizer and returns alphabetic
                 unigrams that pass stopword and sanity filters.  ~300× faster
@@ -428,11 +424,11 @@ def extract_content_words(texts: List[str], min_df: int = 3,
     """
     if method == "spacy":
         return _extract_content_words_spacy(texts, min_df, language, pos_filter, max_df)
-    if method == "sampled_pos":   # fast spaCy-like POS filter, see fast_content_words.py
+    if method == "sampled_pos":   #  see fast_content_words.py
         from .fast_content_words import extract_content_words_sampled
         return extract_content_words_sampled(texts, min_df=min_df, language=language,
                                              pos_filter=pos_filter, max_df=max_df)
-    if method in ("type_pos", "type_pos_templates"):   # see fast_content_words.py
+    if method in ("type_pos", "type_pos_templates"):   #  see fast_content_words.py
         from .fast_content_words import extract_content_words_typed
         return extract_content_words_typed(texts, min_df=min_df, language=language, pos_filter=pos_filter,
                                            max_df=max_df,
@@ -469,66 +465,6 @@ def _extract_content_words_tfidf(texts: List[str], min_df: int, language: str = 
     )
 
 
-def _extract_content_words_spacy(texts: List[str], min_df: int, language: str = "english",
-                                  pos_filter: str = None, max_df: float = 1.0) -> List[str]:
-    """Lemma groups document-frequency (so e.g. "sang"/"singen"/"gesungen"
-    all pool their counts under one lemma, same as before) - but the lemma
-    string itself is never returned as a vocabulary entry. spaCy's German
-    lemmatizer is imperfect enough to occasionally produce a form that isn't
-    a real word at all (e.g. "zugebrachen", "mußtesen" - neither is valid
-    German; both are the lemmatizer over-regularizing a strong/prefixed verb
-    it couldn't resolve correctly), and those malformed strings would
-    otherwise end up as literal "topic words". Instead, each lemma group's
-    most frequent genuine surface form (the actual inflected token as it
-    appears in the text) is returned. Any surviving variant is equally
-    acceptable - lemma is used here purely to group/count, exactly as
-    lemma_dedup uses it purely to compare in topic_assignment.project_vocabulary;
-    neither ever emits the lemma itself as output.
-    """
-    import spacy
-    from collections import defaultdict
-    _CONTENT_POS = {"NOUN", "VERB", "ADJ", "ADV", "PROPN"}
-    model_name = _SPACY_MODEL.get(language, language)  # allow passing a raw model name too
-    nlp = spacy.load(model_name, disable=["parser", "ner", "senter"])
-    # spaCy's default nlp.max_length=1_000_000 chars exists to guard parser/NER
-    # memory (~1GB/100k chars per its own docs) - both already disabled above,
-    # so raising it here is safe and necessary for genuinely long documents
-    # (e.g. full novels: a 1,084,263-character ELTeC novel crashed this with
-    # spaCy's E088 before this fix; tagger+lemmatizer-only has no comparable
-    # per-char memory cost).
-    longest = max((len(t) for t in texts), default=0)
-    if longest >= nlp.max_length:
-        nlp.max_length = longest + 1
-    stop = _stopwords_for(language)
-
-    lemma_doc_count: Counter = Counter()
-    lemma_surface_count: dict = defaultdict(Counter)
-    for doc in nlp.pipe(texts, batch_size=64, n_process=1):
-        doc_lemmas: set = set()
-        for token in doc:
-            keep = (_passes_paper_restricted_filter(token, language) if pos_filter == "paper_restricted"
-                    else token.pos_ in _CONTENT_POS)
-            if keep:
-                lemma = token.lemma_.lower()
-                surface = token.text.lower()
-                if (surface.isalpha() and len(surface) >= 2
-                        and lemma not in stop and surface not in stop
-                        and (language != "german" or (_is_german_alphabet(lemma)
-                                                        and _is_german_alphabet(surface)))):
-                    doc_lemmas.add(lemma)
-                    lemma_surface_count[lemma][surface] += 1
-        lemma_doc_count.update(doc_lemmas)
-
-    n_docs = len(texts)
-    max_df_count = max_df * n_docs
-    result = {
-        lemma_surface_count[lemma].most_common(1)[0][0]
-        for lemma, cnt in lemma_doc_count.items()
-        if min_df <= cnt <= max_df_count
-    }
-    return sorted(result)
-
-
 def extract_content_words_streaming(corpus, min_df: int = 3, max_df: float = 0.98,
                                     language: str = "english"):
     """Streaming counterpart of extract_content_words(method="tfidf") - same
@@ -536,11 +472,12 @@ def extract_content_words_streaming(corpus, min_df: int = 3, max_df: float = 0.9
     vocabulary, same stopword list and malformed-token guard), but built
     from ONE streaming pass over the corpus instead of an in-memory
     CountVectorizer.fit() - for corpora too large to hold as a Python list
-    (SPGC, PG-19).
+    (SPGC, PG-19; see flake/stream.py, whose
+    anchor-selection passes this mirrors).
 
     What this does NOT need to solve, measured directly: the final
-    vocabulary's own size. A streaming count pass over a
-    2,488-book PG-19 sample finds 664,903 raw word types, with
+    vocabulary's own size. flake_stream.py's pass 1a already streams a
+    2,488-book PG-19 sample once and finds 664,903 raw word types, with
     only 74,052 surviving df >= 20 - a content-word vocabulary at full
     PG-19 scale would plausibly land in the low hundreds of thousands,
     the same order of magnitude as FLaKE's own candidate vocabulary
@@ -551,7 +488,7 @@ def extract_content_words_streaming(corpus, min_df: int = 3, max_df: float = 0.9
     over per-document word SETS (so a word occurring 50 times in one
     document still only counts once toward its document frequency, the
     same semantics sklearn's own min_df/max_df use), exactly as
-    the same streaming counter used for FLaKE's own candidate
+    flake_stream.py's pass 1a already does for FLaKE's own candidate
     vocabulary - no new mechanism, just the same one applied to content
     words instead of anchor candidates.
 
@@ -631,7 +568,7 @@ def extract_content_words_spacy_streaming(
 
     Args: same meaning as extract_content_words(method="spacy"), except
         `corpus` replaces `texts` - the same Corpus type
-        katm streaming.pairs_factory accepts (a callable
+        streaming.pairs_factory accepts (a callable
         returning a fresh (id, text) iterator, or iter_text_files /
         iter_parquet_texts). German is not yet supported here (the in-memory
         version's extra alphabet filter isn't ported).
@@ -690,3 +627,63 @@ def extract_content_words_spacy_streaming(
     )
     info = {"n_docs": n_docs, "n_lemmas_seen": len(lemma_doc_count), "timings": {"tag": t_tag}}
     return (vocab, info) if return_info else vocab
+
+
+def _extract_content_words_spacy(texts: List[str], min_df: int, language: str = "english",
+                                  pos_filter: str = None, max_df: float = 1.0) -> List[str]:
+    """Lemma groups document-frequency (so e.g. "sang"/"singen"/"gesungen"
+    all pool their counts under one lemma, same as before) - but the lemma
+    string itself is never returned as a vocabulary entry. spaCy's German
+    lemmatizer is imperfect enough to occasionally produce a form that isn't
+    a real word at all (e.g. "zugebrachen", "mußtesen" - neither is valid
+    German; both are the lemmatizer over-regularizing a strong/prefixed verb
+    it couldn't resolve correctly), and those malformed strings would
+    otherwise end up as literal "topic words". Instead, each lemma group's
+    most frequent genuine surface form (the actual inflected token as it
+    appears in the text) is returned. Any surviving variant is equally
+    acceptable - lemma is used here purely to group/count, exactly as
+    lemma_dedup uses it purely to compare in topic_assignment.project_vocabulary;
+    neither ever emits the lemma itself as output.
+    """
+    import spacy
+    from collections import defaultdict
+    _CONTENT_POS = {"NOUN", "VERB", "ADJ", "ADV", "PROPN"}
+    model_name = _SPACY_MODEL.get(language, language)  # allow passing a raw model name too
+    nlp = spacy.load(model_name, disable=["parser", "ner", "senter"])
+    # spaCy's default nlp.max_length=1_000_000 chars exists to guard parser/NER
+    # memory (~1GB/100k chars per its own docs) - both already disabled above,
+    # so raising it here is safe and necessary for genuinely long documents
+    # (e.g. full novels: a 1,084,263-character ELTeC novel crashed this with
+    # spaCy's E088 before this fix; tagger+lemmatizer-only has no comparable
+    # per-char memory cost).
+    longest = max((len(t) for t in texts), default=0)
+    if longest >= nlp.max_length:
+        nlp.max_length = longest + 1
+    stop = _stopwords_for(language)
+
+    lemma_doc_count: Counter = Counter()
+    lemma_surface_count: dict = defaultdict(Counter)
+    for doc in nlp.pipe(texts, batch_size=64, n_process=1):
+        doc_lemmas: set = set()
+        for token in doc:
+            keep = (_passes_paper_restricted_filter(token, language) if pos_filter == "paper_restricted"
+                    else token.pos_ in _CONTENT_POS)
+            if keep:
+                lemma = token.lemma_.lower()
+                surface = token.text.lower()
+                if (surface.isalpha() and len(surface) >= 2
+                        and lemma not in stop and surface not in stop
+                        and (language != "german" or (_is_german_alphabet(lemma)
+                                                        and _is_german_alphabet(surface)))):
+                    doc_lemmas.add(lemma)
+                    lemma_surface_count[lemma][surface] += 1
+        lemma_doc_count.update(doc_lemmas)
+
+    n_docs = len(texts)
+    max_df_count = max_df * n_docs
+    result = {
+        lemma_surface_count[lemma].most_common(1)[0][0]
+        for lemma, cnt in lemma_doc_count.items()
+        if min_df <= cnt <= max_df_count
+    }
+    return sorted(result)

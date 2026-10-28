@@ -13,6 +13,23 @@ from .topic_assignment import WordTopicProjector
 from .utils import extract_content_words
 
 
+_EMBED_CACHE: dict = {}
+
+
+class _CachedSentenceEmbedder:
+    def __init__(self, base):
+        self._base, self._model, self.model_name = base, base._model, getattr(base, "model_name", "")
+
+    def encode(self, texts, batch_size=32):
+        key = self.model_name
+        cache = _EMBED_CACHE.setdefault(key, {})
+        miss = [t for t in dict.fromkeys(texts) if t not in cache]
+        if miss:
+            for t, v in zip(miss, self._base.encode(miss, batch_size=batch_size)):
+                cache[t] = v
+        return np.stack([cache[t] for t in texts]) if texts else np.array([])
+
+
 class KATM:
     """Keyphrase Anchored Topic Modeling (KATM) main class."""
 
@@ -70,12 +87,20 @@ class KATM:
         discard_hub_clusters: bool = False,
         hub_overcluster_k: int = 5,
         compute_doc_topic_probs: bool = False,
-        clustering_method: str = "gmm",
-        clustering_kwargs: Optional[dict] = None,
+        flake_kwargs: Optional[dict] = None,
         streaming: bool = False,
         stream_batch_size: int = 64,
         stream_candidate_vocab: str = "global",
         stream_progress_every: int = 0,
+        gmm_random_state: int = 42,
+        clustering_method: str = "gmm",
+        clustering_kwargs: Optional[dict] = None,
+        clustering_init: str = "default",
+        anchor_isolation_drop_frac: float = 0.0,
+        anchor_isolation_k: int = 10,
+        anchor_isolation_method: str = "concentration",
+        word_scoring: str = "similarity",
+        exclude_words: Optional[List[str]] = None,
     ):
         """Initialize KATM model.
 
@@ -209,20 +234,16 @@ class KATM:
                 and known false positives (Zeitung, Mannschaft).
                 Default False preserves prior behavior byte-for-byte; ~2-4x
                 slower extraction (one spaCy pass over the corpus).
-            content_words_method: ``"tfidf"`` (default), ``"spacy"``,
-                ``"sampled_pos"``, ``"type_pos"`` or ``"type_pos_templates"``. Controls
+            content_words_method: ``"tfidf"`` (default), ``"spacy"`` or
+                ``"sampled_pos"``. Controls
                 how the vocabulary for topic word projection is built. TF-IDF is
                 ~300× faster; spaCy is more linguistically precise (POS-filtered,
-                lemmatised) but very slow on corpora > ~5,000 docs. The three
-                fast POS options give spaCy-like filtering without tagging the
-                whole corpus: "sampled_pos" tags a few sampled occurrence windows
-                per word (closest to "spacy"), "type_pos" tags each unique word
-                once out of context (fastest, least accurate), "type_pos_templates"
-                tags each word in 4 neutral English frames. All honour
-                content_pos_filter; see fast_content_words.py.
+                lemmatised) but very slow on corpora > ~5,000 docs. "sampled_pos"
+                gives spaCy-like POS filtering by tagging only a few
+                sampled occurrences of each word (+ a capitalisation name filter for
+                English) - see fast_content_words.py.
             content_pos_filter: ``None`` (default) or ``"paper_restricted"``.
-                Affects content_words_method="spacy", "sampled_pos", "type_pos" and
-                "type_pos_templates" ("tfidf" has no POS tags). None keeps the
+                Only affects content_words_method="spacy". None keeps the
                 longstanding broad POS set {NOUN, VERB, ADJ, ADV, PROPN}.
                 "paper_restricted" keeps only NN/ADJA/ADJD/VVFIN (German,
                 exact STTS match) or its hand-mapped English equivalent —
@@ -261,7 +282,16 @@ class KATM:
                 independent of this — pick a model that actually supports
                 the language (e.g. a German or multilingual
                 sentence-transformer) separately.
-            keyphrase_scope: "per_document" (default, unchanged behavior -
+            keyphrase_scope: "flake": the anchor pool is
+                FLaKE's corpus-level selection (flake
+                .extract_flake_keyphrases, default settings) of
+                n_keyphrases_total phrases, used as-is - FLaKE already applies
+                the min_anchor_df / max_anchor_df_ratio gate to its candidates
+                and its facility-location selection already removes
+                redundancy, so KATM's own doc-frequency filtering and greedy
+                semantic dedup (anchor_dedup_threshold) are skipped.
+                ``flake_kwargs`` are passed through to extract_flake_keyphrases.
+            keyphrase_scope (original options): "per_document" (default, unchanged behavior -
                 KeyBERT/RAKE/YAKE runs once per document, candidates pooled
                 and doc-frequency-filtered) or "global" (one pass over the
                 whole corpus instead of one extraction call per document -
@@ -391,17 +421,6 @@ class KATM:
                 contextual_anchor_embedding=True. Default 20 - keeps the
                 cost bounded for very common anchors without needing every
                 single occurrence; ignored otherwise.
-            clustering_method: ``"gmm"`` (default, the original
-                GMMTopicClusterer - unchanged behaviour) or one of
-                clustering_alt.METHODS: ``"spherical_kmeans"`` (k-means on
-                L2-normalised anchor embeddings, 10 inits; the most stable option
-                in the katm_flake experiments), ``"gmm_ninit"``, ``"gmm_hub"``,
-                ``"overcluster_merge"``, ``"agglomerative"``. For anything but
-                "gmm", soft_threshold / gmm_covariance_type / discard_hub_clusters
-                are not used (use "gmm_hub" for hub discarding).
-            clustering_kwargs: extra keyword arguments for
-                clustering_alt.AltTopicClusterer (e.g. ``{"n_init": 10,
-                "random_state": 42}``). Ignored for "gmm".
             discard_hub_clusters: False (default, unchanged behavior). If
                 True, the production GMM (Step 5) fits n_topics +
                 hub_overcluster_k components instead of n_topics, then keeps
@@ -422,42 +441,20 @@ class KATM:
                 independently swept; exposed specifically so it can be
                 tuned per-corpus (see GMMTopicClusterer's docstring for the
                 size/certainty trade-off).
-            compute_doc_topic_probs: False (default - CHANGES PRIOR BEHAVIOR,
-                unlike every other flag in this class). When False, fit()
-                skips Step 8 (encoding every document again and taking
-                cosine similarity to each topic centroid) entirely -
-                doc_topic_probs_ is left as an empty list, and fit_transform
-                returns an all-zero array instead. topics_/get_topic_words
-                are completely unaffected either way - Step 8 runs strictly
-                after project_vocabulary (Step 7) has already fully
-                determined every topic's word list, so nothing about the
-                topics themselves depends on this flag. Measured directly on
-                a real 250-document German novel at 34.5% of total fit()
-                time (67.3s of 195.1s) - the second-largest cost in the
-                whole pipeline after keyphrase extraction itself, for output
-                (doc_topic_probs_, and models.py's run_katm's "top_docs"
-                exemplar lookup built from it) that plain topic-word
-                evaluation never reads. Set True to restore the original
-                behavior - needed for anything that scores or uses
-                per-document topic assignments (e.g. OCTIS-style evaluation
-                harnesses, or pulling exemplar documents per topic).
-                transform() (scoring NEW documents after fit()) is
-                unaffected by this flag either way - it always recomputes
-                fresh from the fitted centroids, independent of
-                doc_topic_probs_.
             streaming: False (default) = everything that touches the corpus runs in
                 memory on a list of documents. True = the corpus is processed as a
                 STREAM, so it never has to fit in memory: ``fit()`` then accepts a
                 list OR a zero-argument callable returning a fresh iterator of texts /
                 (id, text) pairs (it is iterated several times: keyphrases, content
                 words, and, if compute_doc_topic_probs, document vectors). What
-                streams: anchor extraction (per-document algorithms such as
+                streams: anchor extraction (keyphrase_scope="flake" ->
+                extract_flake_keyphrases_streaming; per-document algorithms such as
                 KeyBERT -> batches of ``stream_batch_size`` documents through the same
                 KeyphraseExtractor, keeping only a phrase->document-frequency
                 Counter), content words (all four content_words_method values via
                 streaming.extract_content_words_stream) and Step 8. Not supported
                 with streaming=True: keyphrase_scope="global",
-                contextual_anchor_embedding. If False and a
+                contextual_anchor_embedding, FLaKE partitions. If False and a
                 callable is passed, it is materialised into a list first.
             stream_batch_size: documents per KeyphraseExtractor call when streaming.
             stream_progress_every: print a progress line every N documents during the
@@ -526,6 +523,46 @@ class KATM:
         self.n_topics_covariance_type = n_topics_covariance_type
         self.gmm_covariance_type = gmm_covariance_type
         self.keyphrase_scope = keyphrase_scope
+        self.flake_kwargs = dict(flake_kwargs or {})
+        self.gmm_random_state = gmm_random_state
+        #  "gmm" (default, original GMMTopicClusterer) or one of
+        # clustering_alt.METHODS ("gmm_ninit", "gmm_hub", "spherical_kmeans",
+        # "overcluster_merge", "agglomerative").
+        from .clustering_alt import METHODS as _CL_METHODS
+        if clustering_method != "gmm" and clustering_method not in _CL_METHODS:
+            raise ValueError(f"clustering_method must be 'gmm' or one of {_CL_METHODS}")
+        self.clustering_method = clustering_method
+        self.clustering_kwargs = dict(clustering_kwargs or {})
+        # exploratory: "default" (unchanged behavior) or
+        # "coverage" - seed GMM/k-means with coverage_seed_embeddings
+        # (clustering.py) instead of the clusterer's own kmeans++/EM init.
+        # Only takes effect for clustering_method in ("gmm" with
+        # discard_hub_clusters=False, "spherical_kmeans", "gmm_ninit") AND
+        # keyphrase_scope="flake" with no partitions (the only case where
+        # the docs x anchors relevance graph FLaKE already built is
+        # available) - every other combination silently keeps default init,
+        # since there is no coverage graph to seed from. See
+        # coverage_seed_embeddings's own docstring for the mechanism.
+        self.clustering_init = clustering_init
+        # exploratory: drop the lowest-anchor_isolation_
+        # scores fraction of the anchor pool before clustering (not before
+        # anything else - content words for the final topic word lists come
+        # from a separate, independent extract_content_words() vocabulary,
+        # not from anchor_phrases_, so this only removes points that would
+        # otherwise help define a GMM/k-means centroid - see clustering.
+        # filter_isolated_anchors's docstring). 0.0 (default) = unchanged
+        # behavior (no anchor is ever dropped).
+        self.anchor_isolation_drop_frac = anchor_isolation_drop_frac
+        self.anchor_isolation_k = anchor_isolation_k
+        # "concentration" (default): top-k-neighbor similarity minus
+        # similarity to the rest of the pool - validated on 20NG's real
+        # catch-all topic to separate it from genuine topic words.
+        # "density" (first thing tried, kept for comparison): plain top-k
+        # neighbor similarity - measured and rejected, see clustering.
+        # anchor_isolation_scores's docstring.
+        self.anchor_isolation_method = anchor_isolation_method
+        self.word_scoring = word_scoring  #  see topic_assignment.project_vocabulary
+        self.exclude_words = list(exclude_words or [])
         self.n_keyphrases_total = n_keyphrases_total
         self.global_top_k_docs = global_top_k_docs
         self.global_ranking_mode = global_ranking_mode
@@ -545,11 +582,6 @@ class KATM:
         self.discard_hub_clusters = discard_hub_clusters
         self.hub_overcluster_k = hub_overcluster_k
         self.compute_doc_topic_probs = compute_doc_topic_probs
-        from .clustering_alt import METHODS as _CL_METHODS
-        if clustering_method != "gmm" and clustering_method not in _CL_METHODS:
-            raise ValueError(f"clustering_method must be 'gmm' or one of {_CL_METHODS}")
-        self.clustering_method = clustering_method
-        self.clustering_kwargs = dict(clustering_kwargs or {})
         self.streaming = streaming
         self.stream_batch_size = stream_batch_size
         self.stream_candidate_vocab = stream_candidate_vocab
@@ -560,8 +592,6 @@ class KATM:
         self.topics_: Optional[Dict[int, List[Tuple[str, float]]]] = None
         self.doc_topic_probs_: Optional[List[np.ndarray]] = None
         self._n_fitted_docs = 0
-        self._stream_n_docs_ = 0
-        self.content_words_: Optional[List[str]] = None
         self._embedder: Optional[SentenceEmbedder] = None
         self._clusterer: Optional[GMMTopicClusterer] = None
         self._reducer = None
@@ -575,15 +605,27 @@ class KATM:
         self.anchor_labels_: Optional[np.ndarray] = None
         self.anchor_phrases_: Optional[List[str]] = None
         self.gmm_: Optional[GaussianMixture] = None
+        #  docs x anchors FLaKE relevance graph (sparse),
+        # column-aligned with anchor_phrases_/anchor_embeddings_ - set during
+        # fit() only when keyphrase_scope="flake" and not partitioned; None
+        # otherwise. Used by clustering_init="coverage"; also kept around
+        # (cheap - already computed) for inspection even when not used.
+        self._flake_anchor_relevance_ = None
+        self.coverage_init_used_: bool = False
+        #  diagnostics from anchor_isolation_drop_frac - the
+        # anchors dropped before clustering (phrase strings) and the raw
+        # per-anchor coherence score for every anchor that SURVIVED the FLaKE
+        # pool (pre-drop), for inspection. Both empty/None unless
+        # anchor_isolation_drop_frac > 0.
+        self.dropped_isolated_anchors_: List[str] = []
+        self.anchor_isolation_scores_: Optional[np.ndarray] = None
 
-    def fit(self, documents) -> "KATM":
+    def fit(self, documents: List[str]) -> "KATM":
         """Run full KATM pipeline.
 
         Args:
-            documents: List of document strings (or, with streaming=True, a list or a
-                zero-argument callable returning a fresh iterator of texts / (id, text)
-                pairs). If your raw data is posts, group them into documents before
-                calling fit().
+            documents: List of document strings. If your raw data is posts,
+                group them into documents before calling fit().
 
         Returns:
             self for chaining.
@@ -604,14 +646,93 @@ class KATM:
                 self.doc_topic_probs_ = []
                 return self
 
+        self._flake_anchor_relevance_ = None  # reset each fit() call
+        self.coverage_init_used_ = False
+        self.dropped_isolated_anchors_ = []
+        self.anchor_isolation_scores_ = None
+
         # Step 1: Load the shared embedder first so KeyBERT can reuse it
         embedder = SentenceEmbedder(model_name=self.embedding_model)
+        import os as _os2
+        if _os2.environ.get("KATM_EMBED_CACHE"):
+            # experiment-only: memoise encodings across fits in one process, so
+            # repeated runs that differ only downstream (e.g. clustering) don't
+            # re-encode the same documents / phrases. Off unless the env var is set.
+            embedder = _CachedSentenceEmbedder(embedder)
 
         # Step 2/3: Extract keyphrases and build the doc-frequency-filtered
         # anchor pool. "global" only applies to kp_algorithm="keybert" (see
         # __init__ docstring) - RAKE/YAKE/etc. always run per-document.
+        flake_anchor_embeddings = None
         if self.streaming:
-            all_keyphrases = self._stream_anchors(factory, embedder)
+            all_keyphrases, flake_anchor_embeddings = self._stream_anchors(factory, embedder)
+        elif self.keyphrase_scope == "flake":
+            # FLaKE: one corpus-level, coverage-aware selection of the whole
+            # anchor pool (see flake/core.py).
+            import os as _os, sys as _sys
+            _root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
+            if _root not in _sys.path:
+                _sys.path.insert(0, _root)
+            from ._flake import flake_core
+            extract_flake_keyphrases = flake_core().extract_flake_keyphrases
+            fk = dict(ngram_range=self.keybert_ngram_range, language=self.language,
+                      min_df=self.min_anchor_df, max_df=self.max_anchor_df_ratio)
+            fk.update(self.flake_kwargs)
+            n_parts = int(fk.pop("partitions", 1))
+            part_seed = int(fk.pop("partition_seed", 0))
+            if n_parts <= 1:
+                all_keyphrases, _finfo = extract_flake_keyphrases(
+                    documents, embedder, n_keyphrases=self.n_keyphrases_total, return_details=True, **fk)
+                self.flake_info_ = {"timings": _finfo.get("timings", {}),
+                                    "doc_coverage": _finfo.get("doc_coverage"),
+                                    "n_candidates": len(_finfo.get("candidates", []))}
+                if all_keyphrases:
+                    # reuse FLaKE's phrase embeddings (same model, L2-normalised)
+                    flake_anchor_embeddings = np.asarray(_finfo["candidate_embeddings"])[_finfo["indices"]]
+                    # docs x anchors relevance submatrix, column-aligned with
+                    # all_keyphrases/flake_anchor_embeddings (no dedup/reorder
+                    # happens between here and clustering for keyphrase_scope
+                    # ="flake" - see Step 4b below) - kept for
+                    # clustering_init="coverage"; cheap, it's already built.
+                    self._flake_anchor_relevance_ = _finfo["relevance"][:, _finfo["indices"]]
+            else:
+                # Partitioned FLaKE: random split of the corpus into n_parts
+                # sub-corpora, FLaKE on each (budget K/n_parts each, phrase
+                # embeddings cached across parts so shared vocabulary is
+                # embedded once), anchors merged round-robin until K unique.
+                import time as _time
+                cache = {}
+
+                class _CachedEmb:
+                    _model = embedder._model
+
+                    def encode(self, texts, batch_size=32):
+                        miss = [t for t in dict.fromkeys(texts) if t not in cache]
+                        if miss:
+                            for t_, v_ in zip(miss, embedder.encode(miss, batch_size=batch_size)):
+                                cache[t_] = v_
+                        return np.stack([cache[t_] for t_ in texts]).astype(np.float32)
+
+                _t0 = _time.perf_counter()
+                order = np.random.RandomState(part_seed).permutation(len(documents))
+                per = int(np.ceil(self.n_keyphrases_total / n_parts * 1.5))
+                lists = []
+                for part in np.array_split(order, n_parts):
+                    ph = extract_flake_keyphrases([documents[i] for i in part], _CachedEmb(),
+                                                  n_keyphrases=per, **fk)
+                    lists.append(ph)
+                merged, seen = [], set()
+                for rank in range(per):
+                    for ph in lists:
+                        if rank < len(ph) and ph[rank] not in seen:
+                            seen.add(ph[rank]); merged.append(ph[rank])
+                    if len(merged) >= self.n_keyphrases_total:
+                        break
+                all_keyphrases = merged[: self.n_keyphrases_total]
+                self.flake_info_ = {"timings": {"partitioned_total": _time.perf_counter() - _t0},
+                                    "n_parts": n_parts, "n_embedded_phrases": len(cache)}
+                if all_keyphrases:
+                    flake_anchor_embeddings = np.stack([cache[k_] for k_ in all_keyphrases])
         elif self.keyphrase_scope == "global" and self.kp_algorithm == "keybert":
             from .global_keyphrases import extract_global_keyphrases
             all_keyphrases = extract_global_keyphrases(
@@ -687,7 +808,9 @@ class KATM:
         # isolation, as before. contextual_anchor_embedding=True instead
         # embeds each phrase's actual occurrences-in-context and averages
         # them - see _contextual_embed_keyphrases's docstring for why.
-        if self.contextual_anchor_embedding:
+        if flake_anchor_embeddings is not None and not self.contextual_anchor_embedding:
+            keyphrase_embeddings = self._maybe_normalize(flake_anchor_embeddings)
+        elif self.contextual_anchor_embedding:
             keyphrase_embeddings = self._maybe_normalize(
                 _contextual_embed_keyphrases(
                     all_keyphrases, documents, embedder,
@@ -708,10 +831,30 @@ class KATM:
         # S3: for n ≤ _DEDUP_MATRIX_MAX_N, one cosine_similarity call covers
         # all pairwise sims in a single BLAS op; above that threshold the
         # original per-row loop runs to avoid an oversized n×n allocation.
-        if self.anchor_dedup_threshold is not None:
+        if self.anchor_dedup_threshold is not None and self.keyphrase_scope != "flake":
             keyphrase_embeddings, all_keyphrases = _greedy_dedup(
                 keyphrase_embeddings, all_keyphrases, self.anchor_dedup_threshold
             )
+
+        # Step 4b-bis: optional isolation filter - drop anchors with no
+        # strong relationship to any other anchor in the pool before they
+        # ever reach clustering (see clustering.filter_isolated_anchors's
+        # docstring for the mechanism). 0.0 (default) is a no-op - this
+        # cannot change anything unless explicitly requested.
+        if self.anchor_isolation_drop_frac > 0 and len(all_keyphrases) > 1:
+            from .clustering import anchor_isolation_scores, filter_isolated_anchors
+            self.anchor_isolation_scores_ = anchor_isolation_scores(
+                keyphrase_embeddings, self.anchor_isolation_k, method=self.anchor_isolation_method
+            )
+            keep_mask = filter_isolated_anchors(
+                keyphrase_embeddings, self.anchor_isolation_k, self.anchor_isolation_drop_frac,
+                method=self.anchor_isolation_method,
+            )
+            self.dropped_isolated_anchors_ = [p for p, k in zip(all_keyphrases, keep_mask) if not k]
+            all_keyphrases = [p for p, k in zip(all_keyphrases, keep_mask) if k]
+            keyphrase_embeddings = keyphrase_embeddings[keep_mask]
+            if self._flake_anchor_relevance_ is not None:
+                self._flake_anchor_relevance_ = self._flake_anchor_relevance_[:, keep_mask]
 
         # Step 4c: Automatic cluster-count selection, if requested. Runs on
         # the same (deduped) anchor embeddings that will be clustered below,
@@ -743,7 +886,36 @@ class KATM:
             )
             cluster_input = self._reducer.transform(keyphrase_embeddings)
 
+        # Step 4e: clustering_init="coverage" - seed GMM/k-means from FLaKE's
+        # own relevance graph instead of embedding-space kmeans++/EM init
+        # (see clustering.coverage_seed_embeddings's docstring for the
+        # mechanism and motivation). Only attempted for the combinations it
+        # supports; everywhere else coverage_seeds stays None and the
+        # clusterer below falls back to its own default init exactly as
+        # before - this parameter cannot change behavior unless explicitly
+        # requested AND a coverage graph is actually available.
+        coverage_seeds = None
+        # coverage_over_factor: read from clustering_kwargs as a side-channel
+        # (popped before clustering_kwargs reaches AltTopicClusterer's own
+        # constructor below) - see coverage_seed_embeddings's over_factor
+        # docstring. 1 (default) = unchanged plain coverage seeding.
+        coverage_over_factor = int(self.clustering_kwargs.get("coverage_over_factor", 1))
+        if self.clustering_init == "coverage" and self._flake_anchor_relevance_ is not None:
+            supports_coverage_init = (
+                (self.clustering_method == "gmm" and not self.discard_hub_clusters)
+                or self.clustering_method in ("spherical_kmeans", "gmm_ninit")
+            )
+            if supports_coverage_init:
+                from .clustering import coverage_seed_embeddings
+                coverage_seeds = coverage_seed_embeddings(
+                    self._flake_anchor_relevance_, cluster_input, self.n_topics,
+                    over_factor=coverage_over_factor,
+                )
+        self.coverage_init_used_ = coverage_seeds is not None
+
         # Step 5: Cluster (possibly-reduced) keyphrase embeddings
+        import time as _time
+        _tc = _time.perf_counter()
         if self.clustering_method == "gmm":
             clusterer = GMMTopicClusterer(
                 n_topics=self.n_topics,
@@ -751,12 +923,17 @@ class KATM:
                 covariance_type=self.gmm_covariance_type,
                 discard_hub_clusters=self.discard_hub_clusters,
                 hub_overcluster_k=self.hub_overcluster_k,
+                random_state=self.gmm_random_state,
+                means_init=coverage_seeds,
             )
         else:
             from .clustering_alt import AltTopicClusterer
+            _alt_kwargs = {k: v for k, v in self.clustering_kwargs.items() if k != "coverage_over_factor"}
             clusterer = AltTopicClusterer(n_topics=self.n_topics, method=self.clustering_method,
-                                          **self.clustering_kwargs)
+                                          random_state=self.gmm_random_state, init_centers=coverage_seeds,
+                                          **_alt_kwargs)
         clusterer.fit(cluster_input)
+        self.cluster_time_ = _time.perf_counter() - _tc
         self._embedder  = embedder
         self._clusterer = clusterer
 
@@ -785,6 +962,9 @@ class KATM:
                                                    method=self.content_words_method,
                                                    language=self.language,
                                                    pos_filter=self.content_pos_filter)
+        if self.exclude_words:   # (e.g. character / place names in fiction)
+            _ex = set(self.exclude_words)
+            content_words = [w for w in content_words if w not in _ex]
         self.content_words_ = content_words
 
         # proj_embedder composes embedder.encode() with the fitted reducer's
@@ -812,6 +992,7 @@ class KATM:
                 centroid_blend_alpha=self.centroid_blend_alpha,
                 centroid_top_k=self.centroid_top_k,
                 exclusive_assignment=self.exclusive_assignment,
+                word_scoring=self.word_scoring,
             )
             # Limit to top_n_words per topic
             for tid in self.topics_:
@@ -869,9 +1050,31 @@ class KATM:
         return self
 
     def _stream_anchors(self, factory, embedder):
-        """Step 2/3 for streaming=True: the doc-frequency-filtered anchor phrases, from a stream.
+        """Step 2/3 for streaming=True: returns (anchor phrases, anchor embeddings or None).
         Sets self._stream_n_docs_ (documents streamed)."""
         self._stream_n_docs_ = 0
+        if self.keyphrase_scope == "flake":
+            from ._flake import flake_stream
+            extract_flake_keyphrases_streaming = flake_stream().extract_flake_keyphrases_streaming
+            fk = dict(ngram_range=self.keybert_ngram_range, language=self.language,
+                      min_df=self.min_anchor_df, max_df=self.max_anchor_df_ratio, segment_words=None)
+            fk.update(self.flake_kwargs)
+            if int(fk.pop("partitions", 1)) > 1:
+                raise NotImplementedError("streaming=True does not support flake_kwargs['partitions']")
+            fk.pop("partition_seed", None)
+            fk.pop("contiguous_ngrams", None)   # streaming FLaKE is always contiguous
+            phrases, info = extract_flake_keyphrases_streaming(
+                factory, embedder, n_keyphrases=self.n_keyphrases_total, return_details=True, **fk)
+            self._stream_n_docs_ = int(info["n_passages"])
+            self.flake_info_ = {"timings": info.get("timings", {}), "n_candidates": len(info.get("candidates", [])),
+                                "streaming": True}
+            if not phrases:
+                return [], None
+            emb = np.asarray(info["candidate_embeddings"])[info["indices"]]
+            if self.clustering_init == "coverage":   # the passage graph is only needed for coverage seeding
+                self._flake_anchor_relevance_ = info["relevance"].tocsc()[:, info["indices"]].tocsr()
+            return phrases, emb
+
         from .streaming import extract_perdoc_keyphrases_streaming
         from .utils import _stopwords_for as _kp_stopwords_for
         kp_stop_words = "english" if self.language == "english" else list(_kp_stopwords_for(self.language))
@@ -896,7 +1099,7 @@ class KATM:
             batch_size=self.stream_batch_size, progress_every=self.stream_progress_every, return_info=True)
         self._stream_n_docs_ = info["n_docs"]
         self.keyphrase_stream_info_ = {k: v for k, v in info.items() if k != "doc_freq"}
-        return phrases
+        return phrases, None
 
     def _maybe_normalize(self, x: np.ndarray) -> np.ndarray:
         if not self.normalize_embeddings:

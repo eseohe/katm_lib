@@ -155,91 +155,10 @@ def extract_content_words_sampled(texts: List[str], min_df: int = 3, language: s
 
 
 # ---------------------------------------------------------------------------------------------
-# content_words_method="type_pos": tag every unique candidate word ONCE, without its contexts.
+# Streaming counterpart of extract_content_words_sampled, for corpora too large to hold in
+# memory (SPGC, PG-19) - see flake/stream.py, whose
+# contextual_embed_streaming this mirrors.
 # ---------------------------------------------------------------------------------------------
-_TEMPLATES = ("{w}", "It was {w} .", "They {w} it .", "the {w} of")
-
-
-def extract_content_words_typed(texts: List[str], min_df: int = 3, language: str = "english",
-                                pos_filter: str = "paper_restricted", max_df: float = 1.0,
-                                context: str = "none", max_cap_ratio: float = None, min_len: int = 2,
-                                return_info: bool = False):
-    """Type-level POS: each unique candidate word (df >= min_df) is tagged once, out of context.
-
-    context="none"       the word alone as a one-token document (pure type tagging).
-    context="templates"  (English only) the word in 4 neutral frames - alone, "It was _ .",
-                         "They _ it .", "the _ of" - kept if it passes the POS filter in ANY frame,
-                         i.e. if it CAN be a noun/adjective/finite verb. Lemma = majority over frames.
-    Capitalisation (name) filter and lemma grouping as in extract_content_words_sampled; the
-    capitalisation statistics need one regex pass over the corpus (no tagging).
-    No document frequency per POS is available here, so a lemma is kept if any of its forms
-    passes (method="spacy" requires min_df passing documents).
-    """
-    import spacy
-    from sklearn.feature_extraction.text import CountVectorizer
-    from spacy.tokens import Doc
-    from .utils import _stopwords_for, _SPACY_MODEL
-
-    if max_cap_ratio is None:
-        max_cap_ratio = 1.01 if language == "german" else 0.7
-    if context == "templates" and language != "english":
-        raise ValueError('context="templates" is English-only')
-    t0 = time.perf_counter()
-    stop = _stopwords_for(language)
-    n = len(texts)
-    cv = CountVectorizer(lowercase=True, min_df=min(min_df, n), max_df=max_df if max_df < 1.0 else 1.0,
-                         token_pattern=r"(?u)\b[^\W\d_]{%d,}\b" % min_len, binary=True, dtype="int32")
-    X = cv.fit_transform(texts)
-    vocab = cv.get_feature_names_out()
-    df = dict(zip(vocab, X.sum(axis=0).A1))
-    cand = sorted(w for w in vocab if w not in stop and not re.search(r"(.)\1{2,}", w) and len(w) <= 25)
-    t_count = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    candset = set(cand)
-    caps, mids = Counter(), Counter()
-    if max_cap_ratio <= 1.0:
-        for s in texts:
-            prev = "."
-            for tk in _TOK.findall(s):
-                lw = tk.lower()
-                if lw in candset and prev not in _SENT_END:
-                    mids[lw] += 1
-                    caps[lw] += tk[0].isupper()
-                prev = tk
-    t_caps = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    nlp = spacy.load(_SPACY_MODEL.get(language, language), disable=["parser", "ner"])
-    frames = _TEMPLATES if context == "templates" else ("{w}",)
-    jobs = []
-    for w in cand:
-        for f in frames:
-            words = f.format(w=w).split()
-            jobs.append((w, words.index(w), words))
-    passed, lemma_of = Counter(), defaultdict(Counter)
-    docs = (Doc(nlp.vocab, words=ws) for _, _, ws in jobs)
-    for (w, idx, _), doc in zip(jobs, nlp.pipe(docs, batch_size=2048)):
-        tok = doc[idx]
-        passed[w] += int(_passes(tok, pos_filter, language))
-        lemma_of[w][tok.lemma_.lower()] += 1
-    t_tag = time.perf_counter() - t0
-
-    groups: Dict[str, List[str]] = defaultdict(list)
-    for w in cand:
-        if passed[w] and not (mids[w] >= 3 and caps[w] / mids[w] >= max_cap_ratio):
-            groups[lemma_of[w].most_common(1)[0][0]].append(w)
-    out = sorted(max(ws, key=lambda x: df[x]) for lem, ws in groups.items() if lem not in stop)
-    info = {"n_candidates": len(cand), "n_tagged_items": len(jobs),
-            "timings": {"count": t_count, "caps": t_caps, "tag": t_tag}}
-    return (out, info) if return_info else out
-
-
-# ---------------------------------------------------------------------------------------------
-# Streaming counterparts (KATM(streaming=True)): corpus is a list or a zero-argument callable
-# returning a fresh iterator of texts / (id, text) pairs, never held in memory.
-# ---------------------------------------------------------------------------------------------
-
 def extract_content_words_sampled_streaming(
     corpus, min_df: int = 3, max_df: float = 1.0, language: str = "english",
     pos_filter: str = "paper_restricted", samples_per_word: int = 5, window: int = 8,
@@ -254,7 +173,7 @@ def extract_content_words_sampled_streaming(
     What has to change, and what doesn't:
 
     - Counting candidates (step 1) is the same streaming document-frequency counter
-      already used by utils.extract_content_words_streaming - no new
+      already used by katm.utils.extract_content_words_streaming - no new
       mechanism, just reused.
     - Collecting sample windows (step 2) CANNOT reuse the in-memory version's own
       mechanism unchanged. That version gets an unbiased sample by shuffling the
@@ -388,6 +307,12 @@ def extract_content_words_sampled_streaming(
     return (out, info) if return_info else out
 
 
+# ---------------------------------------------------------------------------------------------
+# content_words_method="type_pos": tag every unique candidate word ONCE, without its contexts.
+# ---------------------------------------------------------------------------------------------
+_TEMPLATES = ("{w}", "It was {w} .", "They {w} it .", "the {w} of")
+
+
 def extract_content_words_typed_streaming(
     corpus, min_df: int = 3, max_df: float = 1.0, language: str = "english",
     pos_filter: str = "paper_restricted", context: str = "none", max_cap_ratio: float = None,
@@ -484,4 +409,79 @@ def extract_content_words_typed_streaming(
     out = sorted(max(ws, key=lambda x: df[x]) for lem, ws in groups.items() if lem not in stop)
     info = {"n_candidates": len(cand), "n_docs": n_docs, "n_tagged_items": len(jobs),
            "timings": {"count": t_count, "caps": t_caps, "tag": t_tag}}
+    return (out, info) if return_info else out
+
+
+def extract_content_words_typed(texts: List[str], min_df: int = 3, language: str = "english",
+                                pos_filter: str = "paper_restricted", max_df: float = 1.0,
+                                context: str = "none", max_cap_ratio: float = None, min_len: int = 2,
+                                return_info: bool = False):
+    """Type-level POS: each unique candidate word (df >= min_df) is tagged once, out of context.
+
+    context="none"       the word alone as a one-token document (pure type tagging).
+    context="templates"  (English only) the word in 4 neutral frames - alone, "It was _ .",
+                         "They _ it .", "the _ of" - kept if it passes the POS filter in ANY frame,
+                         i.e. if it CAN be a noun/adjective/finite verb. Lemma = majority over frames.
+    Capitalisation (name) filter and lemma grouping as in extract_content_words_sampled; the
+    capitalisation statistics need one regex pass over the corpus (no tagging).
+    No document frequency per POS is available here, so a lemma is kept if any of its forms
+    passes (method="spacy" requires min_df passing documents).
+    """
+    import spacy
+    from sklearn.feature_extraction.text import CountVectorizer
+    from spacy.tokens import Doc
+    from .utils import _stopwords_for, _SPACY_MODEL
+
+    if max_cap_ratio is None:
+        max_cap_ratio = 1.01 if language == "german" else 0.7
+    if context == "templates" and language != "english":
+        raise ValueError('context="templates" is English-only')
+    t0 = time.perf_counter()
+    stop = _stopwords_for(language)
+    n = len(texts)
+    cv = CountVectorizer(lowercase=True, min_df=min(min_df, n), max_df=max_df if max_df < 1.0 else 1.0,
+                         token_pattern=r"(?u)\b[^\W\d_]{%d,}\b" % min_len, binary=True, dtype="int32")
+    X = cv.fit_transform(texts)
+    vocab = cv.get_feature_names_out()
+    df = dict(zip(vocab, X.sum(axis=0).A1))
+    cand = sorted(w for w in vocab if w not in stop and not re.search(r"(.)\1{2,}", w) and len(w) <= 25)
+    t_count = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    candset = set(cand)
+    caps, mids = Counter(), Counter()
+    if max_cap_ratio <= 1.0:
+        for s in texts:
+            prev = "."
+            for tk in _TOK.findall(s):
+                lw = tk.lower()
+                if lw in candset and prev not in _SENT_END:
+                    mids[lw] += 1
+                    caps[lw] += tk[0].isupper()
+                prev = tk
+    t_caps = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    nlp = spacy.load(_SPACY_MODEL.get(language, language), disable=["parser", "ner"])
+    frames = _TEMPLATES if context == "templates" else ("{w}",)
+    jobs = []
+    for w in cand:
+        for f in frames:
+            words = f.format(w=w).split()
+            jobs.append((w, words.index(w), words))
+    passed, lemma_of = Counter(), defaultdict(Counter)
+    docs = (Doc(nlp.vocab, words=ws) for _, _, ws in jobs)
+    for (w, idx, _), doc in zip(jobs, nlp.pipe(docs, batch_size=2048)):
+        tok = doc[idx]
+        passed[w] += int(_passes(tok, pos_filter, language))
+        lemma_of[w][tok.lemma_.lower()] += 1
+    t_tag = time.perf_counter() - t0
+
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for w in cand:
+        if passed[w] and not (mids[w] >= 3 and caps[w] / mids[w] >= max_cap_ratio):
+            groups[lemma_of[w].most_common(1)[0][0]].append(w)
+    out = sorted(max(ws, key=lambda x: df[x]) for lem, ws in groups.items() if lem not in stop)
+    info = {"n_candidates": len(cand), "n_tagged_items": len(jobs),
+            "timings": {"count": t_count, "caps": t_caps, "tag": t_tag}}
     return (out, info) if return_info else out

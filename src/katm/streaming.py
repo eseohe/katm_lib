@@ -81,7 +81,7 @@ def extract_perdoc_keyphrases_streaming(
                  (and the other algorithms) score every document independently, so batching does not change
                  any document's keyphrases; only the Counter (distinct phrases -> df) is accumulated.
 
-    `extractor` is a configured katm_flake.keyphrase_extractor.KeyphraseExtractor. If the Counter grows past
+    `extractor` is a configured katm.keyphrase_extractor.KeyphraseExtractor. If the Counter grows past
     `max_counter_items`, phrases seen once so far are dropped (a lossy safety valve; a dropped phrase seen
     again later is counted from 1 - irrelevant at the default size, reported in info["pruned"]).
     """

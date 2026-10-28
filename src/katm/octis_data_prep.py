@@ -30,7 +30,7 @@ _R8_CATEGORIES = {"earn", "acq", "money-fx", "grain", "crude", "trade", "interes
 
 _HF_CONFIGS = {
     "ag_news": {
-        "hf_name": "ag_news",
+        "hf_name": "fancyzhx/ag_news",
         "text_field": "text",
         "label_field": "label",
         "label_names": ["World", "Sports", "Business", "Sci/Tech"],

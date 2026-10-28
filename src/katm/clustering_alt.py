@@ -32,11 +32,27 @@ def _norm(X):
 
 class AltTopicClusterer:
     def __init__(self, n_topics: int, method: str = "spherical_kmeans", random_state: int = 42,
-                 n_init: int = 10, over_factor: int = 3, hub_extra: int = 5, softmax_temp: float = 0.05):
+                 n_init: int = 10, over_factor: int = 3, hub_extra: int = 5, softmax_temp: float = 0.05,
+                 init_centers: "np.ndarray | None" = None):
+        """init_centers: None (default, unchanged behavior - k-means++ / sklearn's
+        own GMM init). Optional (n_topics, D) array of seed centers, e.g. from
+        clustering.coverage_seed_embeddings - exploratory. Only
+        honored by method in ("spherical_kmeans", "gmm_ninit"); ignored (with a
+        silent fallback to this method's normal init) for every other method,
+        and also falls back if its row count doesn't match n_topics - the
+        caller (KATM.fit) may not always know in advance whether a coverage
+        graph was available at the right size. For "spherical_kmeans",
+        KMeans requires n_init=1 when init is an explicit array, so supplying
+        init_centers trades away the n_init restarts this method otherwise
+        uses for stability - it only makes sense when the seed itself is
+        expected to already avoid the bad local optima n_init restarts are
+        there to dodge.
+        """
         if method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}")
         self.n_topics, self.method, self.random_state = n_topics, method, random_state
         self.n_init, self.over_factor, self.hub_extra, self.softmax_temp = n_init, over_factor, hub_extra, softmax_temp
+        self.init_centers = init_centers
         self._gmm = None
         self._inner = None
         self._centers = None
@@ -47,6 +63,9 @@ class AltTopicClusterer:
         X = np.asarray(X, dtype=np.float64)
         K = min(self.n_topics, len(X))
         m = self.method
+        seed = self.init_centers
+        if seed is not None and (len(seed) != K or seed.shape[1] != X.shape[1]):
+            seed = None  # shape mismatch -> no coverage seed available, use default init
         if m in ("gmm", "gmm_hub"):
             from .clustering import GMMTopicClusterer
             self._inner = GMMTopicClusterer(n_topics=K, random_state=self.random_state, covariance_type="diag",
@@ -56,11 +75,14 @@ class AltTopicClusterer:
             self._centers = self._inner.cluster_centers_
         elif m == "gmm_ninit":
             self._gmm = GaussianMixture(n_components=K, covariance_type="diag", random_state=self.random_state,
-                                        max_iter=200, n_init=self.n_init).fit(X)
+                                        max_iter=200, n_init=(1 if seed is not None else self.n_init),
+                                        means_init=seed).fit(X)
             self._centers = self._gmm.means_
         elif m == "spherical_kmeans":
             Xn = _norm(X)
-            km = KMeans(n_clusters=K, n_init=self.n_init, random_state=self.random_state).fit(Xn)
+            init = _norm(seed) if seed is not None else "k-means++"
+            km = KMeans(n_clusters=K, n_init=(1 if seed is not None else self.n_init),
+                       init=init, random_state=self.random_state).fit(Xn)
             self._centers = _norm(km.cluster_centers_)
         elif m == "overcluster_merge":
             Xn = _norm(X)

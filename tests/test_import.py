@@ -7,7 +7,7 @@ import katm
 
 
 def test_version():
-    assert katm.__version__ == "0.3.0"
+    assert katm.__version__ == "0.4.0"
 
 
 def test_all_public_symbols():

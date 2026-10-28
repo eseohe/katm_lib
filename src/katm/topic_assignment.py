@@ -37,6 +37,8 @@ class WordTopicProjector:
         centroid_blend_alpha: float = 0.5,
         centroid_top_k: int = 3,
         exclusive_assignment: bool = False,
+        word_scoring: str = "similarity",
+        word_scoring_temp: float = 0.05,
     ) -> Dict[int, List[Tuple[str, float]]]:
         """Project vocabulary words onto topics via cosine similarity + MMR.
 
@@ -152,6 +154,17 @@ class WordTopicProjector:
                 mechanism in the pipeline that makes topics compete with
                 each other for the same word.
 
+            word_scoring: how a candidate word is ranked
+                for a topic once it passes min_prob.
+                  - "similarity" (default, original): cosine to the topic.
+                  - "margin": cosine to this topic minus the cosine to the
+                    word's best OTHER topic - words that are about as close
+                    to another topic (generic words near every centroid,
+                    e.g. "something", "business") are pushed down.
+                  - "posterior": cosine x softmax(cosines / word_scoring_temp)
+                    for this topic - similarity weighted by how exclusively
+                    the word belongs to this topic (softer than "margin").
+
         Returns:
             Dictionary mapping topic_id to list of (word, similarity) tuples,
             ordered by MMR selection order (best first).
@@ -194,6 +207,20 @@ class WordTopicProjector:
         # to decide which one "owns" a given word.
         best_topic_per_word = np.argmax(sim_matrix, axis=1) if exclusive_assignment else None
 
+        # Distinctiveness-weighted word scores (see word_scoring).
+        score_matrix = None
+        if word_scoring == "margin" and n_topics > 1:
+            srt = np.sort(sim_matrix, axis=1)
+            best, second = srt[:, -1:], srt[:, -2:-1]
+            other_best = np.where(sim_matrix >= best, second, best)   # best competing topic per (word, topic)
+            score_matrix = sim_matrix - other_best
+        elif word_scoring == "posterior":
+            z = sim_matrix / word_scoring_temp
+            z = np.exp(z - z.max(axis=1, keepdims=True))
+            score_matrix = sim_matrix * (z / z.sum(axis=1, keepdims=True))
+        elif word_scoring not in ("similarity", "margin", "posterior"):
+            raise ValueError("word_scoring must be 'similarity', 'margin' or 'posterior'")
+
         for topic_id in range(n_topics):
             if centroid_mode == "mean":
                 sim_to_centroid = sim_matrix[:, topic_id]
@@ -234,6 +261,9 @@ class WordTopicProjector:
             if len(candidate_indices) == 0:
                 continue
 
+            if score_matrix is not None:
+                # rank (and MMR-relevance) by the distinctiveness-weighted score
+                sim_to_centroid = score_matrix[:, topic_id]
             ranked = candidate_indices[
                 np.argsort(sim_to_centroid[candidate_indices])[::-1]
             ]
