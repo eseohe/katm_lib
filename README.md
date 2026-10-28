@@ -9,8 +9,6 @@ The pipeline has four swappable stages:
 3. **Word scoring**: words are ranked for each topic by similarity, margin or posterior (`word_scoring`).
 4. **Content words**: the vocabulary the topic words are drawn from (`content_words_method`), optionally POS-filtered.
 
-KATM also ships a fast variant (`KATMFast`) that accelerates the word-topic projection step; it does not yet support the newer options below.
-
 ---
 
 ## Installation
@@ -52,9 +50,6 @@ docs = dataset.data
 # Spherical k-means on the anchors (recommended, see "Clustering the anchors")
 model = KATM(n_topics=5, kp_algorithm="keybert", clustering_method="spherical_kmeans")
 model.fit(docs)
-
-# Or use the fast variant (original parameter set only, see the note on KATMFast below):
-# model = KATM(n_topics=5, kp_algorithm="keybert", fast=True)
 
 for topic_id, words in model.topics_.items():
     print(f"Topic {topic_id}: {words}")
@@ -134,8 +129,7 @@ model = KATM(n_topics=10, clustering_method="spherical_kmeans", word_scoring="po
 
 | Class / function | Description |
 |---|---|
-| `KATM` | Full KATM topic model. Pass `fast=True` to get `KATMFast` without changing imports. |
-| `KATMFast` | Accelerated KATM variant using vectorized word-topic projection. **Accepts only the original parameter set**: not `clustering_method`, `word_scoring`, `keyphrase_scope`, `streaming` or the other newer options, which raise `TypeError`. |
+| `KATM` | Full KATM topic model. |
 | `DocumentBuilder` | Preprocesses raw documents into cleaned text suitable for topic modeling. |
 | `KeyphraseExtractor` | Extracts keyphrases from documents using a configurable algorithm (KeyBERT, RAKE, YAKE, TF-IDF). |
 | `SentenceEmbedder` | Computes sentence-level embeddings using `sentence-transformers`. |
@@ -143,7 +137,6 @@ model = KATM(n_topics=10, clustering_method="spherical_kmeans", word_scoring="po
 | `GMMTopicClusterer` | The original Gaussian-mixture clusterer. |
 | `select_n_topics` | Chooses the number of topics from the anchor embeddings. |
 | `WordTopicProjector` | Projects vocabulary words into topic space via keyphrase-topic alignment. |
-| `WordTopicProjectorFast` | Vectorized, deduplicated version of `WordTopicProjector`. |
 | `clean_text`, `build_vocabulary`, `extract_content_words`, `strip_email_addresses` | Text utilities. |
 
 ---
@@ -197,7 +190,6 @@ The `notebooks/` directory contains runnable demonstrations of KATM:
 |---|---|
 | `01_quickstart.ipynb` | Basic usage: load 20 newsgroups, fit `KATM`, print topics, compare keyphrase algorithms. |
 | `02_api_walkthrough.ipynb` | Detailed walkthrough of every public class and parameter in the KATM API. |
-| `03_speed_comparison.ipynb` | Benchmark `KATM` vs `KATMFast` on a medium-sized corpus. |
 | `bbc_news_experiment.ipynb` | Topic extraction on the BBC news dataset; evaluates topic coherence. |
 | `bbc_classification_experiment.ipynb` | BBC news with document classification evaluation. |
 | `newsgroups_experiment.ipynb` | Full 20 Newsgroups experiment with LDA baseline comparison and OCTIS evaluation. |
