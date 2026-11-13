@@ -12,12 +12,11 @@ This guide walks you through every step of using the **Keyphrase Anchored Topic 
 4. [Run KATM — Basic Workflow](#4-run-katm--basic-workflow)
 5. [Run KATM — Advanced Options](#5-run-katm--advanced-options)
 6. [Compare Keyphrase Extractors](#6-compare-keyphrase-extractors)
-7. [Use KATMFast for Speed](#7-use-katmfast-for-speed)
-8. [Inspect Results](#8-inspect-results)
-9. [Evaluate with OCTIS Metrics](#9-evaluate-with-octis-metrics)
-10. [Use Standalone Components](#10-use-standalone-components)
-11. [Run the Notebooks](#11-run-the-notebooks)
-12. [End-to-End Example Script](#12-end-to-end-example-script)
+7. [Inspect Results](#7-inspect-results)
+8. [Evaluate with OCTIS Metrics](#8-evaluate-with-octis-metrics)
+9. [Use Standalone Components](#9-use-standalone-components)
+10. [Run the Notebooks](#10-run-the-notebooks)
+11. [End-to-End Example Script](#11-end-to-end-example-script)
 
 ---
 
@@ -196,7 +195,6 @@ doc_topic_matrix = model.fit_transform(documents)
 
 ```python
 model = KATM(
-    fast=False,                      # True = use KATMFast; False = standard KATM
     kp_algorithm="keybert",          # "keybert" | "rake" | "yake" | "tfidf"
     n_keyphrases=10,                 # Number of keyphrases extracted per document
     embedding_model="all-MiniLM-L6-v2",  # Sentence-transformer model name
@@ -226,7 +224,15 @@ model = KATM(
     global_membership_n_per_doc=10,  # Per-doc top-N window, global_ranking_mode="membership" only
     long_document_strategy="truncate",  # "truncate", "chunk" or "chunk_extract"
     n_keyphrases_per_chunk=5,        # long_document_strategy="chunk_extract" only
-    compute_doc_topic_probs=False,   # Populate doc_topic_probs_ during fit() (costly; see 8.2)
+    proper_noun_filter=False,        # False | True | "auto": delete corpus proper nouns before extraction
+    proper_noun_threshold=0.05,      # "auto": apply if names are >= this share of tokens
+    proper_noun_method="capitalization",  # "capitalization" | "spacy" (PROPN) | "ner" (entity labels)
+    proper_noun_ner_labels=("PERSON", "GPE", "ORG"),  # method="ner" only; any spaCy entity labels
+    proper_noun_min_count=3,         # min capitalised/PROPN occurrences to count as a name
+    proper_noun_min_ratio=0.8,       # min capitalised/PROPN share of a word's occurrences
+    proper_nouns_extra=None,         # names to always remove (e.g. lower-case social-media spellings)
+    proper_nouns_keep=None,          # words never to remove
+    compute_doc_topic_probs=False,   # Populate doc_topic_probs_ during fit() (costly; see 7.2)
     lemma_dedup=False,               # Exclude same-lemma words within one topic's word list
     centroid_mode="mean",            # "mean" | "max" | "top_k_anchors" | "blend"
     centroid_blend_alpha=0.5,        # centroid_mode="blend" only
@@ -512,6 +518,60 @@ narrative prose, where this failure mode was found — combine with 5.4's
 `content_pos_filter="paper_restricted"` if you're seeing both a generic
 catch-all topic and grammatical-register clustering.
 
+### 5.9 Corpora dominated by names (`proper_noun_filter`)
+
+On fandom, fiction and news text, anchors and topic words are often just
+character or place names, so every topic reads as the same list of names (this
+came up on Harry Potter Reddit). `proper_noun_filter` finds the corpus's proper
+nouns from the text itself and deletes them from the documents **before**
+keyphrase extraction and vocabulary building, so they can be neither anchors
+nor topic words. No hand-made list is needed.
+
+```python
+model = KATM(n_topics=10, proper_noun_filter=True)             # always filter
+model = KATM(n_topics=10, proper_noun_filter="auto")           # only if names are >= 5% of tokens
+model = KATM(n_topics=10, proper_noun_filter=True,
+             proper_nouns_extra=["hp", "snape"],               # always remove
+             proper_nouns_keep=["china"])                      # never remove
+model.fit(docs)
+model.proper_nouns_          # the set removed (None if nothing was applied)
+model.proper_noun_report_    # share of name tokens, whether applied, number of name types
+```
+
+- `proper_noun_method="capitalization"` (default): a word is a name if it is
+  capitalised in at least `proper_noun_min_ratio` of its mid-sentence uses,
+  counting lower-case uses against it. Suits English; useless for German, where
+  every noun is capitalised. `"spacy"` uses the PROPN tag instead (needs the
+  spaCy model for the language, e.g. `en_core_web_sm`). It works for English
+  too, so use it if you don't want the capitalisation heuristic, and it is the
+  choice for German and French.
+- `proper_noun_method="ner"` uses spaCy's named-entity recogniser and removes
+  only the entity types in `proper_noun_ner_labels`, so you can choose what goes:
+
+  ```python
+  KATM(proper_noun_filter=True, proper_noun_method="ner",
+       proper_noun_ner_labels="PERSON")                    # character names only
+  KATM(proper_noun_filter=True, proper_noun_method="ner",
+       proper_noun_ner_labels=["PERSON", "GPE"])           # people and places
+  ```
+
+  Labels are case-insensitive. With English `en_core_web_sm` they are `PERSON`,
+  `NORP`, `FAC`, `ORG`, `GPE`, `LOC`, `PRODUCT`, `EVENT`, `WORK_OF_ART`, `LAW`
+  and `LANGUAGE`; a label the model doesn't produce raises a `ValueError`.
+  NER is trained on ordinary text, so it can miss invented names (fantasy
+  characters) and lower-case spellings; check `model.proper_nouns_` and top up
+  with `proper_nouns_extra`.
+- `"auto"` applies the filter only when names reach `proper_noun_threshold` of
+  the non-stopword tokens. Measured in the testbed: fandom Reddit 0.10–0.12,
+  English novels about 0.07, State of the Union about 0.07, 20 Newsgroups 0.05,
+  poems 0.014, mental-health Reddit 0.002.
+- Document-topic probabilities are computed on the scrubbed text. Not
+  supported with `streaming=True`.
+- Names that people write in lower case (common on social media) are missed by
+  the capitalisation detector; add them with `proper_nouns_extra`.
+
+---
+
 ## 6. Compare Keyphrase Extractors
 
 ```python
@@ -540,39 +600,9 @@ for algo in algorithms:
 
 ---
 
-## 7. Use KATMFast for Speed
+## 7. Inspect Results
 
-`KATMFast` is a drop-in replacement for `KATM` with two speedups:
-- **S3** — Vectorized anchor deduplication (replaces O(n²) sklearn calls with a single BLAS matrix operation)
-- **S4** — Incremental MMR (replaces O(N·K²) loop with O(N·K) updates)
-
-You can switch to the fast variant with a single parameter — no import changes needed:
-
-```python
-from katm import KATM
-
-model = KATM(n_topics=10, kp_algorithm="keybert", fast=True)
-model.fit(documents)
-model.print_topics(n_words=10)
-```
-
-Or import `KATMFast` directly:
-
-```python
-from katm import KATMFast
-
-model = KATMFast(n_topics=10, kp_algorithm="keybert")
-model.fit(documents)
-model.print_topics(n_words=10)
-```
-
-The API is **identical** to `KATM`. Topics are numerically identical in most cases; only runtime differs.
-
----
-
-## 8. Inspect Results
-
-### 8.1 Topic words
+### 7.1 Topic words
 
 ```python
 for topic_id in sorted(model.topics_.keys()):
@@ -580,7 +610,7 @@ for topic_id in sorted(model.topics_.keys()):
     print(f"Topic {topic_id}: {', '.join(w for w, _ in words)}")
 ```
 
-### 8.2 Document-topic distributions
+### 7.2 Document-topic distributions
 
 ```python
 import numpy as np
@@ -603,7 +633,7 @@ completely unaffected either way. Set `compute_doc_topic_probs=True` if you
 need per-training-document topic assignments (e.g. OCTIS-style evaluation,
 or pulling exemplar documents per topic).
 
-### 8.3 Find documents for a topic
+### 7.3 Find documents for a topic
 
 ```python
 topic_id = 0
@@ -617,7 +647,7 @@ print(f"Topic {topic_id} has {len(docs_for_topic)} docs above threshold {thresho
 
 ---
 
-## 9. Evaluate with OCTIS Metrics
+## 8. Evaluate with OCTIS Metrics
 
 KATM ships with evaluation utilities compatible with [OCTIS](https://github.com/MIND-Lab/OCTIS).
 
@@ -660,11 +690,11 @@ print(metrics)
 
 ---
 
-## 10. Use Standalone Components
+## 9. Use Standalone Components
 
 You can use KATM's building blocks independently for custom pipelines.
 
-### 10.1 KeyphraseExtractor
+### 9.1 KeyphraseExtractor
 
 ```python
 from katm import KeyphraseExtractor
@@ -674,7 +704,7 @@ keyphrases = extractor.extract(documents)
 # Returns: [["phrase1", "phrase2", ...], [...], ...]
 ```
 
-### 10.2 SentenceEmbedder
+### 9.2 SentenceEmbedder
 
 ```python
 from katm import SentenceEmbedder
@@ -684,7 +714,7 @@ embeddings = embedder.encode(documents, batch_size=32)
 # Returns: np array shape (n_docs, 384)
 ```
 
-### 10.3 GMMTopicClusterer
+### 9.3 GMMTopicClusterer
 
 ```python
 from katm import GMMTopicClusterer
@@ -699,7 +729,7 @@ probs = clusterer.predict_proba(embeddings)  # shape (100, 5)
 centroids = clusterer.cluster_centers_         # shape (5, 384)
 ```
 
-### 10.4 WordTopicProjector
+### 9.4 WordTopicProjector
 
 ```python
 from katm import WordTopicProjector
@@ -716,7 +746,7 @@ topic_words = projector.project_vocabulary(
 # Returns: {0: [("quantum", 0.41), ...], 1: [("mars", 0.42), ...], ...}
 ```
 
-### 10.5 DocumentBuilder
+### 9.5 DocumentBuilder
 
 ```python
 from katm import DocumentBuilder
@@ -726,7 +756,7 @@ builder = DocumentBuilder(strategy="fixed_window", chunk_size=10)
 docs = builder.build(raw_texts)
 ```
 
-### 10.6 Utilities
+### 9.6 Utilities
 
 ```python
 from katm import clean_text, build_vocabulary, extract_content_words, strip_email_addresses
@@ -746,7 +776,7 @@ vocab = build_vocabulary(documents, min_df=3)
 content_words = extract_content_words(documents, min_df=3, method="tfidf")
 ```
 
-### 10.7 German and French corpora
+### 9.7 German and French corpora
 
 `language="german"` or `language="french"` (passed to `KATM`, or to
 `KeyphraseExtractor`/`extract_content_words` directly) select an augmented
@@ -778,7 +808,7 @@ multilingual or German-specific `sentence-transformers` model).
 
 ---
 
-## 11. Run the Notebooks
+## 10. Run the Notebooks
 
 The `notebooks/` directory contains 6 runnable demonstrations.
 
@@ -795,7 +825,6 @@ jupyter lab
 |---|---|
 | `01_quickstart.ipynb` | Load data, fit KATM, print topics, try different extractors |
 | `02_api_walkthrough.ipynb` | Every class and parameter explained with examples |
-| `03_speed_comparison.ipynb` | See KATM vs KATMFast timing side-by-side |
 | `bbc_news_experiment.ipynb` | Multi-category news topic extraction |
 | `newsgroups_experiment.ipynb` | Full 20NG with LDA baseline comparison |
 | `ekphrastic_experiment.ipynb` | Literary text topic modeling with inline poetry corpus |
@@ -804,7 +833,7 @@ All notebooks use `sys.path.insert(0, '../src')` so they work out of the box wit
 
 ---
 
-## 12. End-to-End Example Script
+## 11. End-to-End Example Script
 
 Save this as `run_katm.py` and run with `python run_katm.py`:
 
@@ -835,7 +864,6 @@ model = KATM(
     n_keyphrases=10,
     top_n_words=15,
     min_df=2,
-    # fast=True,  # Uncomment to use KATMFast instead
 )
 model.fit(docs)
 

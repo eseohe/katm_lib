@@ -9,6 +9,7 @@ from sklearn.mixture import GaussianMixture
 from .clustering import GMMTopicClusterer
 from .embedding import SentenceEmbedder
 from .keyphrase_extractor import KeyphraseExtractor
+from .proper_nouns import METHODS as _PN_METHODS, normalize_ner_labels as _normalize_ner_labels
 from .topic_assignment import WordTopicProjector
 from .utils import extract_content_words
 
@@ -76,6 +77,14 @@ class KATM:
         dim_reduction_n_components: Optional[int] = None,
         long_document_strategy: str = "truncate",
         n_keyphrases_per_chunk: int = 5,
+        proper_noun_filter: Union[bool, str] = False,
+        proper_noun_threshold: float = 0.05,
+        proper_noun_method: str = "capitalization",
+        proper_noun_min_count: int = 3,
+        proper_noun_min_ratio: float = 0.8,
+        proper_noun_ner_labels: Union[str, List[str]] = ("PERSON", "GPE", "ORG"),
+        proper_nouns_extra: Optional[List[str]] = None,
+        proper_nouns_keep: Optional[List[str]] = None,
         gsc_candidate_ranking: str = "tfidf",
         gsc_candidate_pool=0.9,
         gsc_chunk_size: int = 200,
@@ -495,6 +504,44 @@ class KATM:
                 unaffected by this flag either way - it always recomputes
                 fresh from the fitted centroids, independent of
                 doc_topic_probs_.
+            proper_noun_filter: False (default, unchanged behavior), True, or
+                "auto". For corpora whose anchors and topic words are mostly
+                character/place names (fandom, fiction, news). True detects the
+                corpus's proper nouns from the text itself and deletes them from
+                the documents before keyphrase extraction and vocabulary
+                building, so they can be neither anchors nor topic words.
+                "auto" does the same only if names make up at least
+                proper_noun_threshold of the non-stopword tokens (measured:
+                fandom Reddit 0.10-0.12, English novels ~0.07, State of the
+                Union ~0.07, 20 Newsgroups 0.05, poems 0.014, mental-health
+                Reddit 0.002). Document-topic probabilities are computed on
+                the scrubbed text. Not supported with streaming=True. After
+                fit(): proper_nouns_ (the set removed) and
+                proper_noun_report_ (share, whether applied, counts).
+            proper_noun_threshold: Auto-mode cutoff on the name-token share.
+                Default 0.05.
+            proper_noun_method: "capitalization" (default; a word is a name if
+                it is capitalised in >= proper_noun_min_ratio of its
+                mid-sentence uses, counting lower-case uses against it - suits
+                English), "spacy" (spaCy PROPN rate; works for any language
+                with a spaCy model - English, German, French - and is the one
+                to use for German/French, where capitalisation marks every
+                noun) or "ner" (spaCy named-entity recogniser restricted to
+                proper_noun_ner_labels, e.g. people only).
+            proper_noun_ner_labels: Only used with proper_noun_method="ner":
+                the spaCy entity label, or list of labels, to remove (case-
+                insensitive). Default ("PERSON", "GPE", "ORG"). Use "PERSON"
+                alone to drop character names but keep places and
+                organisations. English en_core_web_sm labels: PERSON, NORP,
+                FAC, ORG, GPE, LOC, PRODUCT, EVENT, WORK_OF_ART, LAW,
+                LANGUAGE. Unknown labels raise a ValueError at fit() time.
+            proper_noun_min_count: Minimum capitalised/PROPN occurrences for a
+                word to count as a name. Default 3.
+            proper_noun_min_ratio: Minimum capitalised (or PROPN) share of a
+                word's occurrences. Default 0.8.
+            proper_nouns_extra: Names to remove regardless of detection, e.g.
+                characters people write in lower case on social media.
+            proper_nouns_keep: Words never to remove even if detected.
         """
         self.kp_algorithm = kp_algorithm
         self.n_keyphrases = n_keyphrases
@@ -577,6 +624,20 @@ class KATM:
         self.dim_reduction_n_components = dim_reduction_n_components
         self.long_document_strategy = long_document_strategy
         self.n_keyphrases_per_chunk = n_keyphrases_per_chunk
+        if proper_noun_filter not in (False, True, "auto"):
+            raise ValueError("proper_noun_filter must be False, True or 'auto'")
+        self.proper_noun_filter = proper_noun_filter
+        self.proper_noun_threshold = proper_noun_threshold
+        self.proper_noun_method = proper_noun_method
+        self.proper_noun_min_count = proper_noun_min_count
+        self.proper_noun_min_ratio = proper_noun_min_ratio
+        if proper_noun_method not in _PN_METHODS:
+            raise ValueError(f"proper_noun_method must be one of {_PN_METHODS}")
+        self.proper_noun_ner_labels = sorted(_normalize_ner_labels(proper_noun_ner_labels))
+        self.proper_nouns_extra = [w.lower() for w in (proper_nouns_extra or [])]
+        self.proper_nouns_keep = {w.lower() for w in (proper_nouns_keep or [])}
+        self.proper_nouns_: Optional[set] = None
+        self.proper_noun_report_: Optional[dict] = None
         self.gsc_candidate_ranking = gsc_candidate_ranking
         self.gsc_candidate_pool = gsc_candidate_pool
         self.gsc_chunk_size = gsc_chunk_size
@@ -627,6 +688,21 @@ class KATM:
         self.dropped_isolated_anchors_: List[str] = []
         self.anchor_isolation_scores_: Optional[np.ndarray] = None
 
+    def _scrub_proper_nouns(self, documents):
+        from .proper_nouns import detect_proper_nouns, proper_noun_share, scrub_proper_nouns
+        names = detect_proper_nouns(documents, self.language, self.proper_noun_method,
+                                    self.proper_noun_min_count, self.proper_noun_min_ratio,
+                                    self.proper_noun_ner_labels)
+        names = (names | set(self.proper_nouns_extra)) - self.proper_nouns_keep
+        share = proper_noun_share(documents, names, self.language)
+        applied = self.proper_noun_filter is True or share >= self.proper_noun_threshold
+        self.proper_noun_report_ = dict(share=share, applied=bool(applied), n_name_types=len(names),
+                                        threshold=self.proper_noun_threshold, mode=self.proper_noun_filter)
+        if not applied:
+            return documents
+        self.proper_nouns_ = names
+        return [scrub_proper_nouns(d, names) for d in documents]
+
     def fit(self, documents: List[str]) -> "KATM":
         """Run full KATM pipeline.
 
@@ -657,6 +733,14 @@ class KATM:
         self.coverage_init_used_ = False
         self.dropped_isolated_anchors_ = []
         self.anchor_isolation_scores_ = None
+
+        # Step 0 (optional): remove proper nouns from the documents so they
+        # cannot become anchors or topic words. No-op unless proper_noun_filter.
+        self.proper_nouns_, self.proper_noun_report_ = None, None
+        if self.proper_noun_filter:
+            if self.streaming:
+                raise NotImplementedError("proper_noun_filter is not supported with streaming=True")
+            documents = self._scrub_proper_nouns(documents)
 
         # Step 1: Load the shared embedder first so KeyBERT can reuse it
         embedder = SentenceEmbedder(model_name=self.embedding_model)

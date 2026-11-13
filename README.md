@@ -176,6 +176,24 @@ There's no universally better setting; compare on your own corpus. See `USAGE_GU
 
 ---
 
+## Corpora full of names
+
+On fandom, fiction and news text, topics often collapse into lists of character names. `proper_noun_filter=True` (or `"auto"`, which applies it only when names are a large share of the text) detects the corpus's proper nouns and removes them before extraction:
+
+```python
+model = KATM(n_topics=10, proper_noun_filter="auto", proper_nouns_extra=["hp"])
+
+# spaCy named-entity recognition, removing only people
+model = KATM(n_topics=10, proper_noun_filter=True,
+             proper_noun_method="ner", proper_noun_ner_labels="PERSON")
+```
+
+`proper_noun_method` is `"capitalization"` (default heuristic), `"spacy"` (PROPN tag) or `"ner"` (choose entity labels such as `PERSON`, `GPE`, `ORG`).
+
+See `USAGE_GUIDE.md` §5.9.
+
+---
+
 ## Content words and large corpora
 
 `content_words_method` chooses the vocabulary topic words are drawn from: `"tfidf"` (default), `"spacy"` (full POS tagging, slow), or the fast POS-filtered `"sampled_pos"`, `"type_pos"` and `"type_pos_templates"`. `streaming=True` fits corpora that don't fit in memory (works with `keyphrase_scope="flake"`). See `USAGE_GUIDE.md` §5.8.
