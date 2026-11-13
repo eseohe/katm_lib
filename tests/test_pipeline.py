@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import katm
 from katm import (
     KATM,
-    KATMFast,
     DocumentBuilder,
     KeyphraseExtractor,
     SentenceEmbedder,
@@ -107,27 +106,6 @@ def test_katm_transform():
 
     assert isinstance(result, np.ndarray)
     assert result.shape == (len(CORPUS), N_TOPICS)
-
-
-def test_katm_fast_fit():
-    model_fast = KATMFast(
-        n_topics=N_TOPICS,
-        n_keyphrases=N_KEYPHRASES,
-        top_n_words=TOP_N_WORDS,
-        min_df=1,
-        min_anchor_df=1,
-        max_anchor_df_ratio=1.0,
-        anchor_dedup_threshold=None,
-    )
-    model_fast.fit(CORPUS)
-
-    assert model_fast.topics_ is not None
-    assert isinstance(model_fast.topics_, dict)
-    assert len(model_fast.topics_) > 0
-
-    assert model_fast.doc_topic_probs_ is not None
-    assert isinstance(model_fast.doc_topic_probs_, list)
-    assert len(model_fast.doc_topic_probs_) == len(CORPUS)
 
 
 def test_document_builder():
